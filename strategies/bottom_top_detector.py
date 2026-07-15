@@ -1,91 +1,96 @@
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
-from config.settings import Settings
-from utils.logger import setup_logger
+import numpy as np
 import pandas as pd
-import time
+from strategies.technical_indicators import TechnicalIndicators
+from utils.logger import setup_logger
 
-logger = setup_logger("binance_connector")
+logger = setup_logger("bottom_top_detector")
 
-class BinanceConnector:
+class BottomTopDetector:
     def __init__(self):
-        if Settings.TESTNET:
-            self.client = Client(
-                Settings.BINANCE_API_KEY, 
-                Settings.BINANCE_API_SECRET, 
-                testnet=True
-            )
-            self.client.API_URL = 'https://testnet.binance.vision/api'
-        else:
-            self.client = Client(
-                Settings.BINANCE_API_KEY, 
-                Settings.BINANCE_API_SECRET
-            )
-        logger.info("✅ تم الاتصال بمنصة Binance بنجاح")
-    
-    def get_account_balance(self, asset='USDT'):
-        """جلب رصيد الحساب"""
-        try:
-            balance = self.client.get_asset_balance(asset=asset)
-            return float(balance['free'])
-        except BinanceAPIException as e:
-            logger.error(f"❌ خطأ في جلب الرصيد: {e}")
-            return 0
-    
-    def get_symbol_price(self, symbol):
-        """جلب السعر الحالي"""
-        try:
-            ticker = self.client.get_symbol_ticker(symbol=symbol)
-            return float(ticker['price'])
-        except BinanceAPIException as e:
-            logger.error(f"❌ خطأ في جلب السعر: {e}")
-            return None
-    
-    def get_klines(self, symbol, interval='1h', limit=100):
-        """جلب البيانات التاريخية (الشموع)"""
-        try:
-            klines = self.client.get_klines(
-                symbol=symbol, 
-                interval=interval, 
-                limit=limit
-            )
-            df = pd.DataFrame(klines, columns=[
-                'timestamp', 'open', 'high', 'low', 'close', 'volume',
-                'close_time', 'quote_volume', 'trades', 
-                'taker_buy_base', 'taker_buy_quote', 'ignore'
-            ])
-            df['close'] = df['close'].astype(float)
-            df['high'] = df['high'].astype(float)
-            df['low'] = df['low'].astype(float)
-            df['volume'] = df['volume'].astype(float)
-            df['open'] = df['open'].astype(float)
-            return df
-        except BinanceAPIException as e:
-            logger.error(f"❌ خطأ في جلب البيانات: {e}")
-            return None
-    
-    def place_buy_order(self, symbol, quantity):
-        """تنفيذ أمر شراء"""
-        try:
-            order = self.client.order_market_buy(
-                symbol=symbol,
-                quantity=quantity
-            )
-            logger.info(f"✅ تم تنفيذ أمر شراء: {symbol} - الكمية: {quantity}")
-            return order
-        except BinanceAPIException as e:
-            logger.error(f"❌ خطأ في أمر الشراء: {e}")
-            return None
-    
-    def place_sell_order(self, symbol, quantity):
-        """تنفيذ أمر بيع"""
-        try:
-            order = self.client.order_market_sell(
-                symbol=symbol,
-                quantity=quantity
-            )
-            logger.info(f"✅ تم تنفيذ أمر بيع: {symbol} - الكمية: {quantity}")
-            return order
-        except BinanceAPIException as e:
-            logger.error(f"❌ خطأ في أمر البيع: {e}")
-            return None
+        self.price_history = []
+        self.indicators = TechnicalIndicators()
+
+    def detect_bottom(self, df, lookback=20):
+        df = self.indicators.add_all_indicators(df)
+        bottom_score = 0
+        reasons = []
+
+        recent_lows = df['low'].tail(lookback)
+        current_low = df['low'].iloc[-1]
+        min_low = recent_lows.min()
+        if current_low <= min_low * 1.02:
+            bottom_score += 30
+            reasons.append(f"السعر قريب من أدنى قاع ({lookback} شمعة)")
+
+        if df['close'].iloc[-1] > df['open'].iloc[-1]:
+            if df['close'].iloc[-2] < df['open'].iloc[-2]:
+                bottom_score += 20
+                reasons.append("انعكاس صعودي (شمعة خضراء بعد حمراء)")
+
+        tech_signals = self.indicators.detect_bottom_signals(df)
+        bottom_score += tech_signals['confidence']
+        reasons.extend(tech_signals['reasons'])
+
+        recent_volume = df['volume'].tail(5).mean()
+        prev_volume = df['volume'].iloc[-10:-5].mean()
+        if recent_volume > prev_volume * 1.5:
+            bottom_score += 15
+            reasons.append("ارتفاع حجم التداول")
+
+        sma_distance = (df['close'].iloc[-1] - df['sma_20'].iloc[-1]) / df['sma_20'].iloc[-1]
+        if sma_distance < -0.05:
+            bottom_score += 20
+            reasons.append(f"السعر تحت المتوسط بـ {abs(sma_distance)*100:.1f}%")
+
+        is_bottom = bottom_score >= 50
+        logger.info(f"📊 نقاط القاع: {bottom_score}")
+
+        return {
+            'is_bottom': is_bottom,
+            'score': bottom_score,
+            'reasons': reasons,
+            'confidence': min(bottom_score / 100, 1.0),
+        }
+
+    def detect_top(self, df, lookback=20):
+        df = self.indicators.add_all_indicators(df)
+        top_score = 0
+        reasons = []
+
+        recent_highs = df['high'].tail(lookback)
+        current_high = df['high'].iloc[-1]
+        max_high = recent_highs.max()
+        if current_high >= max_high * 0.98:
+            top_score += 30
+            reasons.append(f"السعر قريب من أعلى قمة ({lookback} شمعة)")
+
+        if df['close'].iloc[-1] < df['open'].iloc[-1]:
+            if df['close'].iloc[-2] > df['open'].iloc[-2]:
+                top_score += 20
+                reasons.append("انعكاس هبوطي (شمعة حمراء بعد خضراء)")
+
+        tech_signals = self.indicators.detect_top_signals(df)
+        top_score += tech_signals['confidence']
+        reasons.extend(tech_signals['reasons'])
+
+        if len(df) >= 20:
+            price_higher = df['close'].iloc[-1] > df['close'].iloc[-10]
+            rsi_lower = df['rsi'].iloc[-1] < df['rsi'].iloc[-10]
+            if price_higher and rsi_lower:
+                top_score += 25
+                reasons.append("تباعد RSI هبوطي")
+
+        sma_distance = (df['close'].iloc[-1] - df['sma_20'].iloc[-1]) / df['sma_20'].iloc[-1]
+        if sma_distance > 0.08:
+            top_score += 20
+            reasons.append(f"السعر فوق المتوسط بـ {sma_distance*100:.1f}%")
+
+        is_top = top_score >= 50
+        logger.info(f"📊 نقاط الذروة: {top_score}")
+
+        return {
+            'is_top': is_top,
+            'score': top_score,
+            'reasons': reasons,
+            'confidence': min(top_score / 100, 1.0),
+        }
