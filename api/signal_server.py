@@ -10,11 +10,11 @@ Flask API يكشف إشارات التداول (buy/sell/hold) لـ PRO-TRADING-
 import os
 import time
 import threading
+import requests
+import pandas as pd
 from flask import Flask, jsonify
 from flask_cors import CORS
 
-from config.settings import Settings
-from core.binance_connector import BinanceConnector
 from strategies.technical_indicators import TechnicalIndicators
 from strategies.bottom_top_detector import BottomTopDetector
 from ai_teacher.trading_mentor import TradingMentor
@@ -22,9 +22,35 @@ from utils.logger import setup_logger
 
 logger = setup_logger("signal_server")
 
-# 🔑 signal_server يقرا فقط (bilā أوامر حقيقية) — نجبروه يخدم على mainnet
-# بلا ما نمسو Config/Settings.py الأصلي (اللي خاصو يبقى TESTNET=True لأي شي آخر)
-Settings.TESTNET = False
+# 🔑 Binance.com كيبلوكي IP ديال Render (451 geo-restriction) — نفس المشكل اللي طاح فيه
+# Trading-Bot- قبل. نستعملو MEXC (بيانات عامة فقط، قراءة، بلا أوامر) بحال ما درنا هناك.
+MEXC_KLINES_URL = "https://api.mexc.com/api/v3/klines"
+
+
+def get_klines_mexc(symbol: str, interval: str = "1m", limit: int = 100):
+    """يجيب شموع من MEXC (بلا geo-block) ويرجعها كـ DataFrame بنفس شكل BinanceConnector.get_klines"""
+    try:
+        resp = requests.get(
+            MEXC_KLINES_URL,
+            params={"symbol": symbol, "interval": interval, "limit": limit},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+        if not raw:
+            return None
+
+        df = pd.DataFrame(raw, columns=[
+            "timestamp", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume",
+        ])
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = df[col].astype(float)
+        return df
+    except Exception as e:
+        logger.error(f"❌ خطأ فـ جلب بيانات MEXC لـ {symbol}: {e}")
+        return None
+
 
 app = Flask(__name__)
 
@@ -41,7 +67,6 @@ SUPPORTED_SYMBOLS = [
 CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", "0.65"))
 CACHE_TTL_SECONDS = int(os.getenv("SIGNAL_CACHE_TTL", "20"))  # كاش خفيف باش ما نضربوش Binance بزاف
 
-connector = BinanceConnector()
 indicators = TechnicalIndicators()
 detector = BottomTopDetector()
 mentor = TradingMentor()
@@ -53,7 +78,7 @@ _signal_cache = {}  # {symbol: {"data": {...}, "ts": float}}
 def _compute_signal(symbol: str) -> dict:
     """يحسب إشارة واحدة لعملة واحدة."""
     try:
-        df = connector.get_klines(symbol, interval="1m", limit=100)
+        df = get_klines_mexc(symbol, interval="1m", limit=100)
         if df is None or len(df) < 30:
             return {
                 "symbol": symbol,
