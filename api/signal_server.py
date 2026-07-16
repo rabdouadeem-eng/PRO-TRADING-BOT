@@ -74,6 +74,33 @@ mentor = TradingMentor()
 _cache_lock = threading.Lock()
 _signal_cache = {}  # {symbol: {"data": {...}, "ts": float}}
 
+# 🔔 تنبيهات تيليجرام — بوت جديد مخصص لـ PRO-TRADING-BOT (ماشي MyfadherBOT/ABDUGEMINIBOT)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+_last_notified = {}  # {symbol: "buy"|"sell"} — باش ما نكرروش نفس الإشارة كل polling
+
+
+def send_telegram_alert(symbol: str, signal: str, confidence: float, price: float, reasons: list):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    emoji = "🟢" if signal == "buy" else "🔴"
+    label = "شراء" if signal == "buy" else "بيع"
+    reasons_txt = "\n".join(f"• {r}" for r in reasons) if reasons else "—"
+    text = (
+        f"{emoji} <b>إشارة {label} — {symbol}</b>\n"
+        f"السعر: {price}\n"
+        f"الثقة: {confidence*100:.0f}%\n"
+        f"الأسباب:\n{reasons_txt}"
+    )
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=10,
+        )
+    except Exception as e:
+        logger.error(f"❌ فشل إرسال تنبيه تيليجرام: {e}")
+
 
 def _compute_signal(symbol: str) -> dict:
     """يحسب إشارة واحدة لعملة واحدة."""
@@ -104,6 +131,13 @@ def _compute_signal(symbol: str) -> dict:
             signal, confidence, reasons = ai_pred["signal"], ai_pred["confidence"], ["تنبؤ نموذج AI"]
         else:
             signal, confidence, reasons = "hold", max(bottom["confidence"], top["confidence"]), []
+
+        # 🔔 تنبيه تيليجرام — غير إذا الإشارة جديدة (تبدلت عن آخر مرة)، ماشي كل polling
+        if signal in ("buy", "sell") and _last_notified.get(symbol) != signal:
+            send_telegram_alert(symbol, signal, confidence, price, reasons)
+            _last_notified[symbol] = signal
+        elif signal == "hold":
+            _last_notified.pop(symbol, None)  # نفسحو الحالة باش إشارة جديدة تنبه من جديد لاحقا
 
         return {
             "symbol": symbol,
