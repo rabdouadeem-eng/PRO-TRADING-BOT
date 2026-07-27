@@ -64,7 +64,7 @@ SUPPORTED_SYMBOLS = [
     "DOGEUSDT", "SHIBUSDT", "PEPEUSDT",
 ]
 
-CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", "0.65"))
+CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", "0.80"))
 CACHE_TTL_SECONDS = int(os.getenv("SIGNAL_CACHE_TTL", "20"))  # كاش خفيف باش ما نضربوش Binance بزاف
 
 indicators = TechnicalIndicators()
