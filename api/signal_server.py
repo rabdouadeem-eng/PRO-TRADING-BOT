@@ -509,4 +509,118 @@ async function loadSignals() {
           <div class="${cls}">${label} (${(s.confidence*100).toFixed(0)}%)</div>
           <div>
             <button class="btn-buy" onclick="openTrade('${s.symbol}','buy',${s.price})" ${!s.price ? "disabled" : ""}>شراء</button>
-            <button class="b
+            <button class="btn-sell" onclick="openTrade('${s.symbol}','sell',${s.price})" ${!s.price ? "disabled" : ""}>بيع</button>
+          </div>
+        </div>
+        <div class="sig-reason">${reasonTxt} = ${label} (${(s.confidence*100).toFixed(0)}%)</div>
+      </div>
+    `; }).join("");
+
+    renderTrades();
+    renderStats();
+  } catch (e) {
+    document.getElementById("signals").innerHTML = "❌ خطأ فـ جلب الإشارات";
+  }
+}
+
+loadSettings();
+renderTrades();
+renderStats();
+loadSignals();
+setInterval(loadSignals, 20000);
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/forex-dashboard", methods=["GET"])
+def forex_dashboard():
+    return FOREX_DASHBOARD_HTML
+
+
+# ─────────────────────────────────────────────────────────
+# 🤖 Telegram Webhook — كيرد على الأوامر (/start, /status, /signals)
+# ─────────────────────────────────────────────────────────
+
+def _handle_telegram_command(text: str, chat_id):
+    cmd = text.strip().split()[0].lower() if text.strip() else ""
+
+    if cmd == "/start":
+        send_telegram_message(
+            chat_id,
+            "🤖 <b>PRO TRADING BOT</b> — مرحبا بيك!\n\n"
+            "هذا البوت كيبعت تنبيهات آلية بلا تدخلك (buy/sell) على العملات لي تحت المراقبة.\n\n"
+            "الأوامر المتاحة:\n"
+            "/status — حالة السيرفر\n"
+            "/signals — آخر إشارات كل العملات (كريبتو)\n"
+            "/forex — آخر إشارات الفوركس + ذهب/فضة",
+        )
+    elif cmd == "/status":
+        send_telegram_message(chat_id, f"✅ السيرفر شغال. حد الثقة الحالي: {CONFIDENCE_THRESHOLD*100:.0f}%")
+    elif cmd == "/signals":
+        results = [_get_cached_or_compute(s) for s in SUPPORTED_SYMBOLS]
+        lines = [f"{r['symbol']}: {r['signal']} ({r['confidence']*100:.0f}%)" for r in results]
+        send_telegram_message(chat_id, "📊 <b>آخر الإشارات</b>\n" + "\n".join(lines))
+    elif cmd == "/forex":
+        results = [_get_cached_or_compute(s, market="forex") for s in FOREX_SYMBOLS]
+        lines = [f"{r['symbol']}: {r['signal']} ({r['confidence']*100:.0f}%)" for r in results]
+        send_telegram_message(chat_id, "💱 <b>فوركس + ذهب/فضة</b>\n" + "\n".join(lines))
+    else:
+        send_telegram_message(chat_id, "❓ أمر غير معروف. جرب /start")
+
+
+@app.route("/telegram/webhook", methods=["POST"])
+def telegram_webhook():
+    # حماية بسيطة: Telegram كيبعت هاد الهيدر إيلا كنت غادي بـ secret_token فـ setWebhook
+    if TELEGRAM_WEBHOOK_SECRET:
+        header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if header_secret != TELEGRAM_WEBHOOK_SECRET:
+            return jsonify({"error": "unauthorized"}), 401
+
+    update = request.get_json(silent=True) or {}
+    message = update.get("message") or update.get("edited_message")
+    if message:
+        chat_id = message.get("chat", {}).get("id")
+        text = message.get("text", "")
+        if chat_id and text.startswith("/"):
+            try:
+                _handle_telegram_command(text, chat_id)
+            except Exception as e:
+                logger.error(f"❌ خطأ فـ معالجة أمر تيليجرام: {e}")
+
+    return jsonify({"ok": True})
+
+
+# ─────────────────────────────────────────────────────────
+# ⚡ فيتامين سي — Keep-Alive باش الـ free instance ما ينعسش
+# Render كيرقد السيرفر بعد ~15 دقيقة بلا طلبات خارجية.
+# هاد الـ thread كيضرب URL العمومي ديال السيرفر (ماشي localhost)
+# كل 10 دقايق باش يبقى live.
+# ─────────────────────────────────────────────────────────
+
+KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_INTERVAL_SECONDS", str(10 * 60)))
+# Render كيزيد هاد الـ env var أوتوماتيكيا (اسم السيرفيس + .onrender.com)
+SELF_URL = os.getenv("RENDER_EXTERNAL_URL", "")
+
+
+def _keep_alive_loop():
+    if not SELF_URL:
+        logger.warning("⚠️ RENDER_EXTERNAL_URL غير موجود — keep-alive معطل")
+        return
+    ping_url = f"{SELF_URL.rstrip('/')}/api/health"
+    while True:
+        time.sleep(KEEP_ALIVE_INTERVAL)
+        try:
+            requests.get(ping_url, timeout=10)
+            logger.info("💊 keep-alive ping ✅")
+        except Exception as e:
+            logger.warning(f"⚠️ keep-alive ping فشل: {e}")
+
+
+threading.Thread(target=_keep_alive_loop, daemon=True).start()
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
