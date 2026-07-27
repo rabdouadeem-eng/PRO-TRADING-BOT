@@ -4,6 +4,8 @@ signal_server.py
 Flask API يكشف إشارات التداول (buy/sell/hold) لـ PRO-TRADING-BOT.
 مخصص باش يستهلكه فرونت-إند خارجي (مثل Sandoq) عبر polling.
 
++ Webhook Telegram (/telegram/webhook) باش البوت يرد على /start و أوامر أخرى.
+
 لا ينفذ أي صفقة حقيقية — فقط يحلل ويرجع القرار + الثقة + الأسباب.
 """
 
@@ -12,7 +14,7 @@ import time
 import threading
 import requests
 import pandas as pd
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 from strategies.technical_indicators import TechnicalIndicators
@@ -77,7 +79,24 @@ _signal_cache = {}  # {symbol: {"data": {...}, "ts": float}}
 # 🔔 تنبيهات تيليجرام — بوت جديد مخصص لـ PRO-TRADING-BOT (ماشي MyfadherBOT/ABDUGEMINIBOT)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# سر بسيط باش نتأكدو أن الطلب جاي فعلا من Telegram (اختياري لكن مستحسن)
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+
 _last_notified = {}  # {symbol: "buy"|"sell"} — باش ما نكرروش نفس الإشارة كل polling
+
+
+def send_telegram_message(chat_id, text: str):
+    """إرسال رسالة عامة لأي chat_id (كتستعمل من الأوامر ومن التنبيهات)."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            timeout=10,
+        )
+    except Exception as e:
+        logger.error(f"❌ فشل إرسال رسالة تيليجرام: {e}")
 
 
 def send_telegram_alert(symbol: str, signal: str, confidence: float, price: float, reasons: list):
@@ -92,14 +111,7 @@ def send_telegram_alert(symbol: str, signal: str, confidence: float, price: floa
         f"الثقة: {confidence*100:.0f}%\n"
         f"الأسباب:\n{reasons_txt}"
     )
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
-            timeout=10,
-        )
-    except Exception as e:
-        logger.error(f"❌ فشل إرسال تنبيه تيليجرام: {e}")
+    send_telegram_message(TELEGRAM_CHAT_ID, text)
 
 
 def _compute_signal(symbol: str) -> dict:
@@ -122,7 +134,6 @@ def _compute_signal(symbol: str) -> dict:
 
         price = float(df["close"].iloc[-1])
 
-        # قرار مركّب: نديرو priority لـ bottom/top detector (rule-based) + AI كتأكيد
         if bottom["is_bottom"] and bottom["confidence"] >= CONFIDENCE_THRESHOLD:
             signal, confidence, reasons = "buy", bottom["confidence"], bottom["reasons"]
         elif top["is_top"] and top["confidence"] >= CONFIDENCE_THRESHOLD:
@@ -132,12 +143,11 @@ def _compute_signal(symbol: str) -> dict:
         else:
             signal, confidence, reasons = "hold", max(bottom["confidence"], top["confidence"]), []
 
-        # 🔔 تنبيه تيليجرام — غير إذا الإشارة جديدة (تبدلت عن آخر مرة)، ماشي كل polling
         if signal in ("buy", "sell") and _last_notified.get(symbol) != signal:
             send_telegram_alert(symbol, signal, confidence, price, reasons)
             _last_notified[symbol] = signal
         elif signal == "hold":
-            _last_notified.pop(symbol, None)  # نفسحو الحالة باش إشارة جديدة تنبه من جديد لاحقا
+            _last_notified.pop(symbol, None)
 
         return {
             "symbol": symbol,
@@ -188,6 +198,54 @@ def get_all_signals():
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
+
+
+# ─────────────────────────────────────────────────────────
+# 🤖 Telegram Webhook — كيرد على الأوامر (/start, /status, /signals)
+# ─────────────────────────────────────────────────────────
+
+def _handle_telegram_command(text: str, chat_id):
+    cmd = text.strip().split()[0].lower() if text.strip() else ""
+
+    if cmd == "/start":
+        send_telegram_message(
+            chat_id,
+            "🤖 <b>PRO TRADING BOT</b> — مرحبا بيك!\n\n"
+            "هذا البوت كيبعت تنبيهات آلية بلا تدخلك (buy/sell) على العملات لي تحت المراقبة.\n\n"
+            "الأوامر المتاحة:\n"
+            "/status — حالة السيرفر\n"
+            "/signals — آخر إشارات كل العملات",
+        )
+    elif cmd == "/status":
+        send_telegram_message(chat_id, f"✅ السيرفر شغال. حد الثقة الحالي: {CONFIDENCE_THRESHOLD*100:.0f}%")
+    elif cmd == "/signals":
+        results = [_get_cached_or_compute(s) for s in SUPPORTED_SYMBOLS]
+        lines = [f"{r['symbol']}: {r['signal']} ({r['confidence']*100:.0f}%)" for r in results]
+        send_telegram_message(chat_id, "📊 <b>آخر الإشارات</b>\n" + "\n".join(lines))
+    else:
+        send_telegram_message(chat_id, "❓ أمر غير معروف. جرب /start")
+
+
+@app.route("/telegram/webhook", methods=["POST"])
+def telegram_webhook():
+    # حماية بسيطة: Telegram كيبعت هاد الهيدر إيلا كنت غادي بـ secret_token فـ setWebhook
+    if TELEGRAM_WEBHOOK_SECRET:
+        header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if header_secret != TELEGRAM_WEBHOOK_SECRET:
+            return jsonify({"error": "unauthorized"}), 401
+
+    update = request.get_json(silent=True) or {}
+    message = update.get("message") or update.get("edited_message")
+    if message:
+        chat_id = message.get("chat", {}).get("id")
+        text = message.get("text", "")
+        if chat_id and text.startswith("/"):
+            try:
+                _handle_telegram_command(text, chat_id)
+            except Exception as e:
+                logger.error(f"❌ خطأ فـ معالجة أمر تيليجرام: {e}")
+
+    return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
