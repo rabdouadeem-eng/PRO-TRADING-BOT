@@ -105,7 +105,7 @@ def send_telegram_alert(symbol: str, signal: str, confidence: float, price: floa
 def _compute_signal(symbol: str) -> dict:
     """يحسب إشارة واحدة لعملة واحدة."""
     try:
-        df = get_klines_mexc(symbol, interval="1m", limit=100)
+        df = get_klines_mexc(symbol, interval="5m", limit=100)
         if df is None or len(df) < 30:
             return {
                 "symbol": symbol,
