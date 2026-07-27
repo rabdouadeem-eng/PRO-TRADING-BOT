@@ -359,7 +359,19 @@ function saveSettings() {
   alert("تم الحفظ ✅");
 }
 
-function loadTrades() { return JSON.parse(localStorage.getItem(TRADES_KEY) || "[]"); }
+function loadTrades() {
+  let trades = JSON.parse(localStorage.getItem(TRADES_KEY) || "[]");
+  // توافق مع صفقات قديمة (قبل إضافة openedAt/status) — نصلحوها بدل ما نمسحوها
+  let migrated = false;
+  trades = trades.map(t => {
+    if (!t.openedAt) { t.openedAt = t.id || Date.now(); migrated = true; }
+    // صفقات قديمة ناجية معناها ماتسكراتش (النسخة القديمة كانت كتمسح الصفقة عند الإغلاق) — فهي مازالة مفتوحة
+    if (!t.status) { t.status = "open"; migrated = true; }
+    return t;
+  });
+  if (migrated) localStorage.setItem(TRADES_KEY, JSON.stringify(trades));
+  return trades;
+}
 function saveTrades(trades) { localStorage.setItem(TRADES_KEY, JSON.stringify(trades)); }
 
 function signalClass(sig, conf) {
@@ -501,7 +513,7 @@ async function loadSignals() {
     div.innerHTML = data.signals.map(s => {
       const cls = signalClass(s.signal, s.confidence);
       const label = signalLabel(s.signal, s.confidence);
-      const reasonTxt = (s.reasons && s.reasons.length) ? s.reasons.join(" + ") : "لا توجد بيانات كافية";
+      const reasonTxt = (s.reasons && s.reasons.length) ? s.reasons.join(" + ") : "لم تصل الثقة لعتبة الدخول (80%)";
       return `
       <div class="sig-row">
         <div class="sig-top">
