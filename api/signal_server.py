@@ -274,6 +274,171 @@ def health():
     return jsonify({"status": "ok"})
 
 
+FOREX_DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>صندوق الفوركس — PRO TRADING BOT</title>
+<style>
+  body { background:#0d0d0d; color:#eee; font-family:sans-serif; margin:0; padding:12px; }
+  h2 { font-size:16px; margin:14px 0 8px; }
+  .card { background:#161616; border:1px solid #2a2a2a; border-radius:10px; padding:12px; margin-bottom:14px; }
+  .row { display:flex; gap:8px; margin-bottom:8px; }
+  .row > div { flex:1; }
+  label { font-size:12px; color:#999; display:block; margin-bottom:3px; }
+  input { width:100%; background:#0d0d0d; border:1px solid #333; color:#eee; padding:8px; border-radius:6px; box-sizing:border-box; }
+  button { border:none; border-radius:6px; padding:9px 14px; font-weight:bold; cursor:pointer; }
+  .btn-save { background:#333; color:#eee; width:100%; }
+  .btn-buy { background:#1e9e50; color:#fff; flex:1; }
+  .btn-sell { background:#c0392b; color:#fff; flex:1; }
+  .btn-close { background:#444; color:#eee; font-size:11px; padding:4px 8px; }
+  .sig-row { display:flex; justify-content:space-between; align-items:center; padding:8px 0; border-bottom:1px solid #222; }
+  .sig-row:last-child { border-bottom:none; }
+  .buy { color:#2ecc71; } .sell { color:#e74c3c; } .hold { color:#999; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th, td { text-align:center; padding:6px 4px; border-bottom:1px solid #222; }
+  .green { color:#2ecc71; } .red { color:#e74c3c; }
+</style>
+</head>
+<body>
+  <h2>💱 رأس المال والمخاطرة</h2>
+  <div class="card">
+    <div class="row">
+      <div><label>رأس المال $</label><input id="capital" type="number" value="1000"></div>
+      <div><label>مخاطرة %</label><input id="risk" type="number" value="1"></div>
+    </div>
+    <div class="row">
+      <div><label>وقف الخسارة %</label><input id="sl" type="number" value="1.5"></div>
+      <div><label>هدف الربح %</label><input id="tp" type="number" value="3"></div>
+    </div>
+    <button class="btn-save" onclick="saveSettings()">💾 حفظ الإعدادات</button>
+  </div>
+
+  <h2>📊 الإشارات الحية</h2>
+  <div class="card" id="signals">جاري التحميل...</div>
+
+  <h2>🧾 سجل الصفقات (Paper Trading)</h2>
+  <div class="card">
+    <table>
+      <thead><tr><th>الزوج</th><th>الاتجاه</th><th>دخول</th><th>SL</th><th>TP</th><th>ربح محتمل $</th><th></th></tr></thead>
+      <tbody id="trades"></tbody>
+    </table>
+  </div>
+
+<script>
+const SETTINGS_KEY = "forex_dashboard_settings";
+const TRADES_KEY = "forex_dashboard_trades";
+
+function loadSettings() {
+  const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
+  if (s.capital) document.getElementById("capital").value = s.capital;
+  if (s.risk) document.getElementById("risk").value = s.risk;
+  if (s.sl) document.getElementById("sl").value = s.sl;
+  if (s.tp) document.getElementById("tp").value = s.tp;
+}
+function saveSettings() {
+  const s = {
+    capital: parseFloat(document.getElementById("capital").value),
+    risk: parseFloat(document.getElementById("risk").value),
+    sl: parseFloat(document.getElementById("sl").value),
+    tp: parseFloat(document.getElementById("tp").value),
+  };
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+  alert("تم الحفظ ✅");
+}
+
+function loadTrades() {
+  return JSON.parse(localStorage.getItem(TRADES_KEY) || "[]");
+}
+function saveTrades(trades) {
+  localStorage.setItem(TRADES_KEY, JSON.stringify(trades));
+}
+
+function openTrade(symbol, direction, price) {
+  const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
+  const capital = s.capital || 1000;
+  const riskPct = (s.risk || 1) / 100;
+  const slPct = (s.sl || 1.5) / 100;
+  const tpPct = (s.tp || 3) / 100;
+
+  const sl = direction === "buy" ? price * (1 - slPct) : price * (1 + slPct);
+  const tp = direction === "buy" ? price * (1 + tpPct) : price * (1 - tpPct);
+  const potentialProfit = capital * riskPct * (tpPct / slPct);
+
+  const trades = loadTrades();
+  trades.push({
+    id: Date.now(),
+    symbol, direction, entry: price,
+    sl: sl.toFixed(5), tp: tp.toFixed(5),
+    profit: potentialProfit.toFixed(2),
+    ts: new Date().toLocaleString("ar")
+  });
+  saveTrades(trades);
+  renderTrades();
+}
+
+function closeTrade(id) {
+  const trades = loadTrades().filter(t => t.id !== id);
+  saveTrades(trades);
+  renderTrades();
+}
+
+function renderTrades() {
+  const trades = loadTrades();
+  const tbody = document.getElementById("trades");
+  if (trades.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" style="color:#666;">لا توجد صفقات بعد</td></tr>';
+    return;
+  }
+  tbody.innerHTML = trades.map(t => `
+    <tr>
+      <td>${t.symbol}</td>
+      <td class="${t.direction === 'buy' ? 'green' : 'red'}">${t.direction === 'buy' ? 'شراء' : 'بيع'}</td>
+      <td>${t.entry}</td>
+      <td>${t.sl}</td>
+      <td>${t.tp}</td>
+      <td class="green">${t.profit}</td>
+      <td><button class="btn-close" onclick="closeTrade(${t.id})">إغلاق</button></td>
+    </tr>
+  `).join("");
+}
+
+async function loadSignals() {
+  try {
+    const res = await fetch("/api/forex-signals");
+    const data = await res.json();
+    const div = document.getElementById("signals");
+    div.innerHTML = data.signals.map(s => `
+      <div class="sig-row">
+        <div><b>${s.symbol}</b> — ${s.price ?? "—"}</div>
+        <div class="${s.signal}">${s.signal.toUpperCase()} (${(s.confidence*100).toFixed(0)}%)</div>
+        <div>
+          <button class="btn-buy" onclick="openTrade('${s.symbol}','buy',${s.price})" ${!s.price ? "disabled" : ""}>شراء</button>
+          <button class="btn-sell" onclick="openTrade('${s.symbol}','sell',${s.price})" ${!s.price ? "disabled" : ""}>بيع</button>
+        </div>
+      </div>
+    `).join("");
+  } catch (e) {
+    document.getElementById("signals").innerHTML = "❌ خطأ فـ جلب الإشارات";
+  }
+}
+
+loadSettings();
+renderTrades();
+loadSignals();
+setInterval(loadSignals, 20000);
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/forex-dashboard", methods=["GET"])
+def forex_dashboard():
+    return FOREX_DASHBOARD_HTML
+
+
 # ─────────────────────────────────────────────────────────
 # 🤖 Telegram Webhook — كيرد على الأوامر (/start, /status, /signals)
 # ─────────────────────────────────────────────────────────
@@ -359,3 +524,4 @@ threading.Thread(target=_keep_alive_loop, daemon=True).start()
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+        
