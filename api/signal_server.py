@@ -54,6 +54,61 @@ def get_klines_mexc(symbol: str, interval: str = "1m", limit: int = 100):
         return None
 
 
+# 💱 Forex + Gold/Silver — عبر Twelve Data (مجاني، 800 طلب/يوم)
+# المفتاح: https://twelvedata.com/apikey (تسجيل مجاني)
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
+TWELVEDATA_URL = "https://api.twelvedata.com/time_series"
+
+# Symbol داخلي (بلا سلاش) → Symbol لي كيفهمو Twelve Data (بسلاش)
+FOREX_SYMBOL_MAP = {
+    "EURUSD": "EUR/USD",
+    "GBPUSD": "GBP/USD",
+    "USDJPY": "USD/JPY",
+    "XAUUSD": "XAU/USD",
+    "XAGUSD": "XAG/USD",
+}
+FOREX_SYMBOLS = list(FOREX_SYMBOL_MAP.keys())
+
+
+def get_klines_forex(symbol: str, interval: str = "5min", limit: int = 100):
+    """يجيب شموع فوركس/ذهب/فضة من Twelve Data ويرجعها بنفس شكل get_klines_mexc."""
+    if not TWELVEDATA_API_KEY:
+        logger.warning("⚠️ TWELVEDATA_API_KEY غير موجود — الفوركس معطل")
+        return None
+    td_symbol = FOREX_SYMBOL_MAP.get(symbol)
+    if not td_symbol:
+        return None
+    try:
+        resp = requests.get(
+            TWELVEDATA_URL,
+            params={
+                "symbol": td_symbol,
+                "interval": interval,
+                "outputsize": limit,
+                "apikey": TWELVEDATA_API_KEY,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+        values = raw.get("values")
+        if not values:
+            logger.error(f"❌ رد Twelve Data بلا بيانات لـ {symbol}: {raw}")
+            return None
+
+        df = pd.DataFrame(values)
+        df = df.rename(columns={"datetime": "timestamp"})
+        for col in ["open", "high", "low", "close"]:
+            df[col] = df[col].astype(float)
+        df["volume"] = df.get("volume", 0)
+        # Twelve Data كيرجع الأحدث فالأول — نقلبو الترتيب باش يكون الأقدم فالأول
+        df = df.iloc[::-1].reset_index(drop=True)
+        return df
+    except Exception as e:
+        logger.error(f"❌ خطأ فـ جلب بيانات Twelve Data لـ {symbol}: {e}")
+        return None
+
+
 app = Flask(__name__)
 
 # CORS: بدّل origin بدومان Sandoq الحقيقي فـ production بدل "*"
@@ -114,10 +169,14 @@ def send_telegram_alert(symbol: str, signal: str, confidence: float, price: floa
     send_telegram_message(TELEGRAM_CHAT_ID, text)
 
 
-def _compute_signal(symbol: str) -> dict:
-    """يحسب إشارة واحدة لعملة واحدة."""
+def _compute_signal(symbol: str, market: str = "crypto") -> dict:
+    """يحسب إشارة واحدة لعملة/زوج واحد. market: 'crypto' (MEXC) أو 'forex' (Twelve Data)."""
     try:
-        df = get_klines_mexc(symbol, interval="5m", limit=100)
+        if market == "forex":
+            df = get_klines_forex(symbol, interval="5min", limit=100)
+        else:
+            df = get_klines_mexc(symbol, interval="5m", limit=100)
+
         if df is None or len(df) < 30:
             return {
                 "symbol": symbol,
@@ -167,16 +226,17 @@ def _compute_signal(symbol: str) -> dict:
         }
 
 
-def _get_cached_or_compute(symbol: str) -> dict:
+def _get_cached_or_compute(symbol: str, market: str = "crypto") -> dict:
+    cache_key = f"{market}:{symbol}"
     now = time.time()
     with _cache_lock:
-        cached = _signal_cache.get(symbol)
+        cached = _signal_cache.get(cache_key)
         if cached and (now - cached["ts"]) < CACHE_TTL_SECONDS:
             return cached["data"]
 
-    data = _compute_signal(symbol)
+    data = _compute_signal(symbol, market=market)
     with _cache_lock:
-        _signal_cache[symbol] = {"data": data, "ts": now}
+        _signal_cache[cache_key] = {"data": data, "ts": now}
     return data
 
 
@@ -192,6 +252,20 @@ def get_signal(symbol):
 def get_all_signals():
     """يرجع إشارات كل العملات المدعومة فـ نداء واحد — هذا اللي يستعملو Sandoq."""
     results = [_get_cached_or_compute(s) for s in SUPPORTED_SYMBOLS]
+    return jsonify({"threshold": CONFIDENCE_THRESHOLD, "signals": results, "ts": time.time()})
+
+
+@app.route("/api/forex-signal/<symbol>", methods=["GET"])
+def get_forex_signal(symbol):
+    symbol = symbol.upper()
+    if symbol not in FOREX_SYMBOLS:
+        return jsonify({"error": f"symbol {symbol} not supported"}), 400
+    return jsonify(_get_cached_or_compute(symbol, market="forex"))
+
+
+@app.route("/api/forex-signals", methods=["GET"])
+def get_all_forex_signals():
+    results = [_get_cached_or_compute(s, market="forex") for s in FOREX_SYMBOLS]
     return jsonify({"threshold": CONFIDENCE_THRESHOLD, "signals": results, "ts": time.time()})
 
 
@@ -214,7 +288,8 @@ def _handle_telegram_command(text: str, chat_id):
             "هذا البوت كيبعت تنبيهات آلية بلا تدخلك (buy/sell) على العملات لي تحت المراقبة.\n\n"
             "الأوامر المتاحة:\n"
             "/status — حالة السيرفر\n"
-            "/signals — آخر إشارات كل العملات",
+            "/signals — آخر إشارات كل العملات (كريبتو)\n"
+            "/forex — آخر إشارات الفوركس + ذهب/فضة",
         )
     elif cmd == "/status":
         send_telegram_message(chat_id, f"✅ السيرفر شغال. حد الثقة الحالي: {CONFIDENCE_THRESHOLD*100:.0f}%")
@@ -222,6 +297,10 @@ def _handle_telegram_command(text: str, chat_id):
         results = [_get_cached_or_compute(s) for s in SUPPORTED_SYMBOLS]
         lines = [f"{r['symbol']}: {r['signal']} ({r['confidence']*100:.0f}%)" for r in results]
         send_telegram_message(chat_id, "📊 <b>آخر الإشارات</b>\n" + "\n".join(lines))
+    elif cmd == "/forex":
+        results = [_get_cached_or_compute(s, market="forex") for s in FOREX_SYMBOLS]
+        lines = [f"{r['symbol']}: {r['signal']} ({r['confidence']*100:.0f}%)" for r in results]
+        send_telegram_message(chat_id, "💱 <b>فوركس + ذهب/فضة</b>\n" + "\n".join(lines))
     else:
         send_telegram_message(chat_id, "❓ أمر غير معروف. جرب /start")
 
@@ -246,6 +325,35 @@ def telegram_webhook():
                 logger.error(f"❌ خطأ فـ معالجة أمر تيليجرام: {e}")
 
     return jsonify({"ok": True})
+
+
+# ─────────────────────────────────────────────────────────
+# ⚡ فيتامين سي — Keep-Alive باش الـ free instance ما ينعسش
+# Render كيرقد السيرفر بعد ~15 دقيقة بلا طلبات خارجية.
+# هاد الـ thread كيضرب URL العمومي ديال السيرفر (ماشي localhost)
+# كل 10 دقايق باش يبقى live.
+# ─────────────────────────────────────────────────────────
+
+KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_INTERVAL_SECONDS", str(10 * 60)))
+# Render كيزيد هاد الـ env var أوتوماتيكيا (اسم السيرفيس + .onrender.com)
+SELF_URL = os.getenv("RENDER_EXTERNAL_URL", "")
+
+
+def _keep_alive_loop():
+    if not SELF_URL:
+        logger.warning("⚠️ RENDER_EXTERNAL_URL غير موجود — keep-alive معطل")
+        return
+    ping_url = f"{SELF_URL.rstrip('/')}/api/health"
+    while True:
+        time.sleep(KEEP_ALIVE_INTERVAL)
+        try:
+            requests.get(ping_url, timeout=10)
+            logger.info("💊 keep-alive ping ✅")
+        except Exception as e:
+            logger.warning(f"⚠️ keep-alive ping فشل: {e}")
+
+
+threading.Thread(target=_keep_alive_loop, daemon=True).start()
 
 
 if __name__ == "__main__":
