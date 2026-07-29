@@ -18,6 +18,12 @@ class TechnicalIndicators:
         df['ema_12'] = EMAIndicator(close=df['close'], window=12).ema_indicator()
         df['ema_26'] = EMAIndicator(close=df['close'], window=26).ema_indicator()
 
+        # 📈 EMA 20/50/200 — تحديد الترند (استراتيجية السكالب)
+        df['ema_20'] = EMAIndicator(close=df['close'], window=20).ema_indicator()
+        df['ema_50'] = EMAIndicator(close=df['close'], window=50).ema_indicator()
+        # EMA 200 محتاجة 200 شمعة على الأقل؛ إيلا ماكانوش كافيين، كيرجع NaN وكنتعاملو معاها فـ trend_direction
+        df['ema_200'] = EMAIndicator(close=df['close'], window=200).ema_indicator()
+
         # RSI
         df['rsi'] = RSIIndicator(close=df['close'], window=14).rsi()
 
@@ -46,6 +52,85 @@ class TechnicalIndicators:
         ).average_true_range()
 
         return df
+
+    @staticmethod
+    def trend_direction(df) -> dict:
+        """
+        يحدد اتجاه الترند بناءً على ترتيب EMA 20/50/200 (استراتيجية السكالب).
+        صاعد: close > ema200 > ema50 و ema20 فوقهم كاملين.
+        هابط: العكس.
+        إيلا EMA200 مازال NaN (بيانات قليلة)، كنستعملو غير EMA20/50 كـ fallback أضعف.
+        """
+        latest = df.iloc[-1]
+        ema20, ema50, ema200 = latest.get('ema_20'), latest.get('ema_50'), latest.get('ema_200')
+        close = latest['close']
+
+        if pd.notna(ema200):
+            if close > ema200 and ema50 > ema200 and ema20 > ema50:
+                return {"direction": "up", "strength": "strong"}
+            if close < ema200 and ema50 < ema200 and ema20 < ema50:
+                return {"direction": "down", "strength": "strong"}
+
+        # Fallback بلا EMA200 (بيانات قليلة) — نعتمدو غير 20/50
+        if pd.notna(ema20) and pd.notna(ema50):
+            if close > ema50 and ema20 > ema50:
+                return {"direction": "up", "strength": "weak"}
+            if close < ema50 and ema20 < ema50:
+                return {"direction": "down", "strength": "weak"}
+
+        return {"direction": "neutral", "strength": "none"}
+
+    @staticmethod
+    def rsi_momentum_ok(df, direction: str) -> bool:
+        """
+        شرط RSI 40-60 (زخم بلا تشبع) — بحال الإستراتيجية.
+        للشراء: RSI بين 40-60 ويتجه للأعلى.
+        للبيع: RSI بين 40-60 ويتجه للأسفل.
+        """
+        latest_rsi = df['rsi'].iloc[-1]
+        prev_rsi = df['rsi'].iloc[-2]
+        if pd.isna(latest_rsi) or pd.isna(prev_rsi):
+            return False
+        in_range = 40 <= latest_rsi <= 60
+        if direction == "up":
+            return in_range and latest_rsi > prev_rsi
+        if direction == "down":
+            return in_range and latest_rsi < prev_rsi
+        return False
+
+    @staticmethod
+    def technical_sl_tp(df, direction: str, entry_price: float, lookback: int = 20) -> dict:
+        """
+        SL/TP مبني على البنية الفنية (قاع/قمة + EMA50) بدل نسبة ثابتة فقط — بحال الإستراتيجية.
+        شراء: SL تحت آخر قاع واضح أو EMA50 (الأبعد يفوز أمانا)، TP بنسبة R:R 1:2.
+        بيع: نفس المبدأ بالعكس.
+        """
+        latest = df.iloc[-1]
+        ema50 = latest.get('ema_50')
+        recent = df.tail(lookback)
+
+        if direction == "buy":
+            swing_low = recent['low'].min()
+            candidates = [swing_low]
+            if pd.notna(ema50) and ema50 < entry_price:
+                candidates.append(ema50)
+            sl = min(candidates) * 0.999  # هامش صغير تحت المستوى
+            risk = entry_price - sl
+            tp = entry_price + (risk * 2)  # R:R 1:2
+        else:  # sell
+            swing_high = recent['high'].max()
+            candidates = [swing_high]
+            if pd.notna(ema50) and ema50 > entry_price:
+                candidates.append(ema50)
+            sl = max(candidates) * 1.001
+            risk = sl - entry_price
+            tp = entry_price - (risk * 2)
+
+        return {
+            "sl": round(float(sl), 5),
+            "tp": round(float(tp), 5),
+            "risk_reward": 2.0,
+        }
 
     @staticmethod
     def detect_bottom_signals(df):
