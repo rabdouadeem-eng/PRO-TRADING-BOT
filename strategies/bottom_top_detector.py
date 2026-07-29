@@ -42,6 +42,21 @@ class BottomTopDetector:
             bottom_score += 20
             reasons.append(f"السعر تحت المتوسط بـ {abs(sma_distance)*100:.1f}%")
 
+        # 📈 فلتر الترند (EMA 20/50/200) — بحال الإستراتيجية: نفضلو الشراء فترند صاعد
+        trend = self.indicators.trend_direction(df)
+        if trend["direction"] == "up":
+            bonus = 20 if trend["strength"] == "strong" else 10
+            bottom_score += bonus
+            reasons.append(f"الترند صاعد (EMA) — {trend['strength']}")
+        elif trend["direction"] == "down":
+            bottom_score -= 15
+            reasons.append("⚠️ الترند هابط (EMA) — إشارة الشراء أضعف")
+
+        # ⚡ زخم RSI 40-60 بلا تشبع (بحال الإستراتيجية)
+        if self.indicators.rsi_momentum_ok(df, "up"):
+            bottom_score += 15
+            reasons.append("RSI فمنطقة 40-60 ويتجه للأعلى (زخم صحي)")
+
         is_bottom = bottom_score >= 50
         logger.info(f"📊 نقاط القاع: {bottom_score}")
 
@@ -49,7 +64,7 @@ class BottomTopDetector:
             'is_bottom': is_bottom,
             'score': bottom_score,
             'reasons': reasons,
-            'confidence': min(bottom_score / 100, 1.0),
+            'confidence': min(max(bottom_score, 0) / 100, 1.0),
         }
 
     def detect_top(self, df, lookback=20):
@@ -85,6 +100,21 @@ class BottomTopDetector:
             top_score += 20
             reasons.append(f"السعر فوق المتوسط بـ {sma_distance*100:.1f}%")
 
+        # 📈 فلتر الترند (EMA 20/50/200) — بحال الإستراتيجية: نفضلو البيع فترند هابط
+        trend = self.indicators.trend_direction(df)
+        if trend["direction"] == "down":
+            bonus = 20 if trend["strength"] == "strong" else 10
+            top_score += bonus
+            reasons.append(f"الترند هابط (EMA) — {trend['strength']}")
+        elif trend["direction"] == "up":
+            top_score -= 15
+            reasons.append("⚠️ الترند صاعد (EMA) — إشارة البيع أضعف")
+
+        # ⚡ زخم RSI 40-60 بلا تشبع (بحال الإستراتيجية)
+        if self.indicators.rsi_momentum_ok(df, "down"):
+            top_score += 15
+            reasons.append("RSI فمنطقة 40-60 ويتجه للأسفل (زخم صحي)")
+
         is_top = top_score >= 50
         logger.info(f"📊 نقاط الذروة: {top_score}")
 
@@ -92,5 +122,6 @@ class BottomTopDetector:
             'is_top': is_top,
             'score': top_score,
             'reasons': reasons,
-            'confidence': min(top_score / 100, 1.0),
-        }
+            'confidence': min(max(top_score, 0) / 100, 1.0),
+            }
+        
