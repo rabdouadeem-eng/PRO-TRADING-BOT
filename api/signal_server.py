@@ -4,9 +4,8 @@ signal_server.py
 Flask API يكشف إشارات التداول (buy/sell/hold) لـ PRO-TRADING-BOT.
 مخصص باش يستهلكه فرونت-إند خارجي (مثل Sandoq) عبر polling.
 
-+ Webhook Telegram (/telegram/webhook) باش البوت يرد على /start و أوامر أخرى.
-
 لا ينفذ أي صفقة حقيقية — فقط يحلل ويرجع القرار + الثقة + الأسباب.
+تتبع الصفقات (Paper Trading) توا فالسيرفر (position_tracker.py) بدل localStorage.
 """
 
 import os
@@ -21,16 +20,14 @@ from strategies.technical_indicators import TechnicalIndicators
 from strategies.bottom_top_detector import BottomTopDetector
 from ai_teacher.trading_mentor import TradingMentor
 from utils.logger import setup_logger
+from position_tracker import PositionTracker
 
 logger = setup_logger("signal_server")
 
-# 🔑 Binance.com كيبلوكي IP ديال Render (451 geo-restriction) — نفس المشكل اللي طاح فيه
-# Trading-Bot- قبل. نستعملو MEXC (بيانات عامة فقط، قراءة، بلا أوامر) بحال ما درنا هناك.
 MEXC_KLINES_URL = "https://api.mexc.com/api/v3/klines"
 
 
 def get_klines_mexc(symbol: str, interval: str = "1m", limit: int = 100):
-    """يجيب شموع من MEXC (بلا geo-block) ويرجعها كـ DataFrame بنفس شكل BinanceConnector.get_klines"""
     try:
         resp = requests.get(
             MEXC_KLINES_URL,
@@ -41,7 +38,6 @@ def get_klines_mexc(symbol: str, interval: str = "1m", limit: int = 100):
         raw = resp.json()
         if not raw:
             return None
-
         df = pd.DataFrame(raw, columns=[
             "timestamp", "open", "high", "low", "close", "volume",
             "close_time", "quote_volume",
@@ -54,12 +50,9 @@ def get_klines_mexc(symbol: str, interval: str = "1m", limit: int = 100):
         return None
 
 
-# 💱 Forex + Gold/Silver — عبر Twelve Data (مجاني، 800 طلب/يوم)
-# المفتاح: https://twelvedata.com/apikey (تسجيل مجاني)
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
 TWELVEDATA_URL = "https://api.twelvedata.com/time_series"
 
-# Symbol داخلي (بلا سلاش) → Symbol لي كيفهمو Twelve Data (بسلاش)
 FOREX_SYMBOL_MAP = {
     "EURUSD": "EUR/USD",
     "GBPUSD": "GBP/USD",
@@ -71,7 +64,6 @@ FOREX_SYMBOLS = list(FOREX_SYMBOL_MAP.keys())
 
 
 def get_klines_forex(symbol: str, interval: str = "5min", limit: int = 100):
-    """يجيب شموع فوركس/ذهب/فضة من Twelve Data ويرجعها بنفس شكل get_klines_mexc."""
     if not TWELVEDATA_API_KEY:
         logger.warning("⚠️ TWELVEDATA_API_KEY غير موجود — الفوركس معطل")
         return None
@@ -95,13 +87,11 @@ def get_klines_forex(symbol: str, interval: str = "5min", limit: int = 100):
         if not values:
             logger.error(f"❌ رد Twelve Data بلا بيانات لـ {symbol}: {raw}")
             return None
-
         df = pd.DataFrame(values)
         df = df.rename(columns={"datetime": "timestamp"})
         for col in ["open", "high", "low", "close"]:
             df[col] = df[col].astype(float)
         df["volume"] = df.get("volume", 0)
-        # Twelve Data كيرجع الأحدث فالأول — نقلبو الترتيب باش يكون الأقدم فالأول
         df = df.iloc[::-1].reset_index(drop=True)
         return df
     except Exception as e:
@@ -111,37 +101,32 @@ def get_klines_forex(symbol: str, interval: str = "5min", limit: int = 100):
 
 app = Flask(__name__)
 
-# CORS: بدّل origin بدومان Sandoq الحقيقي فـ production بدل "*"
 ALLOWED_ORIGIN = os.getenv("SANDOQ_ORIGIN", "*")
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGIN}})
 
-# الأزواج اللي كيدعمها Sandoq (لازم يتطابقو مع COINS فـ Sandoq)
 SUPPORTED_SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT",
     "DOGEUSDT", "SHIBUSDT", "PEPEUSDT",
 ]
 
 CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", "0.80"))
-CACHE_TTL_SECONDS = int(os.getenv("SIGNAL_CACHE_TTL", "20"))  # كاش خفيف باش ما نضربوش Binance بزاف
+CACHE_TTL_SECONDS = int(os.getenv("SIGNAL_CACHE_TTL", "20"))
 
 indicators = TechnicalIndicators()
 detector = BottomTopDetector()
 mentor = TradingMentor()
 
 _cache_lock = threading.Lock()
-_signal_cache = {}  # {symbol: {"data": {...}, "ts": float}}
+_signal_cache = {}
 
-# 🔔 تنبيهات تيليجرام — بوت جديد مخصص لـ PRO-TRADING-BOT (ماشي MyfadherBOT/ABDUGEMINIBOT)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-# سر بسيط باش نتأكدو أن الطلب جاي فعلا من Telegram (اختياري لكن مستحسن)
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 
-_last_notified = {}  # {symbol: "buy"|"sell"} — باش ما نكرروش نفس الإشارة كل polling
+_last_notified = {}
 
 
 def send_telegram_message(chat_id, text: str):
-    """إرسال رسالة عامة لأي chat_id (كتستعمل من الأوامر ومن التنبيهات)."""
     if not TELEGRAM_BOT_TOKEN:
         return
     try:
@@ -170,7 +155,6 @@ def send_telegram_alert(symbol: str, signal: str, confidence: float, price: floa
 
 
 def _compute_signal(symbol: str, market: str = "crypto") -> dict:
-    """يحسب إشارة واحدة لعملة/زوج واحد. market: 'crypto' (MEXC) أو 'forex' (Twelve Data)."""
     try:
         if market == "forex":
             df = get_klines_forex(symbol, interval="5min", limit=100)
@@ -179,11 +163,8 @@ def _compute_signal(symbol: str, market: str = "crypto") -> dict:
 
         if df is None or len(df) < 30:
             return {
-                "symbol": symbol,
-                "signal": "hold",
-                "confidence": 0.0,
-                "reasons": ["بيانات غير كافية"],
-                "price": None,
+                "symbol": symbol, "signal": "hold", "confidence": 0.0,
+                "reasons": ["بيانات غير كافية"], "price": None,
             }
 
         df = indicators.add_all_indicators(df)
@@ -209,20 +190,15 @@ def _compute_signal(symbol: str, market: str = "crypto") -> dict:
             _last_notified.pop(symbol, None)
 
         return {
-            "symbol": symbol,
-            "signal": signal,
+            "symbol": symbol, "signal": signal,
             "confidence": round(float(confidence), 4),
-            "reasons": reasons,
-            "price": price,
+            "reasons": reasons, "price": price,
         }
     except Exception as e:
         logger.error(f"❌ خطأ فـ حساب الإشارة لـ {symbol}: {e}")
         return {
-            "symbol": symbol,
-            "signal": "hold",
-            "confidence": 0.0,
-            "reasons": [f"error: {e}"],
-            "price": None,
+            "symbol": symbol, "signal": "hold", "confidence": 0.0,
+            "reasons": [f"error: {e}"], "price": None,
         }
 
 
@@ -240,6 +216,11 @@ def _get_cached_or_compute(symbol: str, market: str = "crypto") -> dict:
     return data
 
 
+# ✅ تتبع الصفقات فالسيرفر (بدل localStorage) — يفحص TP/SL كل دقيقة فالخلفية
+tracker = PositionTracker(get_signal_func=_get_cached_or_compute)
+tracker.start_background_checker()
+
+
 @app.route("/api/signal/<symbol>", methods=["GET"])
 def get_signal(symbol):
     symbol = symbol.upper()
@@ -250,7 +231,6 @@ def get_signal(symbol):
 
 @app.route("/api/signals", methods=["GET"])
 def get_all_signals():
-    """يرجع إشارات كل العملات المدعومة فـ نداء واحد — هذا اللي يستعملو Sandoq."""
     results = [_get_cached_or_compute(s) for s in SUPPORTED_SYMBOLS]
     return jsonify({"threshold": CONFIDENCE_THRESHOLD, "signals": results, "ts": time.time()})
 
@@ -267,6 +247,40 @@ def get_forex_signal(symbol):
 def get_all_forex_signals():
     results = [_get_cached_or_compute(s, market="forex") for s in FOREX_SYMBOLS]
     return jsonify({"threshold": CONFIDENCE_THRESHOLD, "signals": results, "ts": time.time()})
+
+
+# ─── Routes جداد: فتح/غلق/قراءة الصفقات (فالسيرفر، دائم) ───
+@app.route("/api/trade/open", methods=["POST"])
+def open_trade():
+    data = request.get_json(force=True)
+    result = tracker.open_trade(
+        symbol=data["symbol"],
+        direction=data["direction"],
+        price=float(data["price"]),
+        sl=float(data["sl"]),
+        tp=float(data["tp"]),
+        market=data.get("market", "forex"),
+        reason=data.get("reason", ""),
+    )
+    return jsonify(result)
+
+
+@app.route("/api/trade/close/<int:trade_id>", methods=["POST"])
+def close_trade(trade_id):
+    result = tracker.close_trade(trade_id)
+    if result is None:
+        return jsonify({"error": "trade not found or already closed"}), 404
+    return jsonify(result)
+
+
+@app.route("/api/trades", methods=["GET"])
+def get_trades():
+    return jsonify(tracker.get_all_trades())
+
+
+@app.route("/api/trade-stats", methods=["GET"])
+def get_trade_stats():
+    return jsonify(tracker.get_stats())
 
 
 @app.route("/api/health", methods=["GET"])
@@ -338,7 +352,6 @@ FOREX_DASHBOARD_HTML = """<!DOCTYPE html>
 
 <script>
 const SETTINGS_KEY = "forex_dashboard_settings";
-const TRADES_KEY = "forex_dashboard_trades";
 let latestSignals = {};
 
 function loadSettings() {
@@ -359,21 +372,6 @@ function saveSettings() {
   alert("تم الحفظ ✅");
 }
 
-function loadTrades() {
-  let trades = JSON.parse(localStorage.getItem(TRADES_KEY) || "[]");
-  // توافق مع صفقات قديمة (قبل إضافة openedAt/status) — نصلحوها بدل ما نمسحوها
-  let migrated = false;
-  trades = trades.map(t => {
-    if (!t.openedAt) { t.openedAt = t.id || Date.now(); migrated = true; }
-    // صفقات قديمة ناجية معناها ماتسكراتش (النسخة القديمة كانت كتمسح الصفقة عند الإغلاق) — فهي مازالة مفتوحة
-    if (!t.status) { t.status = "open"; migrated = true; }
-    return t;
-  });
-  if (migrated) localStorage.setItem(TRADES_KEY, JSON.stringify(trades));
-  return trades;
-}
-function saveTrades(trades) { localStorage.setItem(TRADES_KEY, JSON.stringify(trades)); }
-
 function signalClass(sig, conf) {
   if (sig === "buy") return "buy";
   if (sig === "sell") return "sell";
@@ -387,40 +385,32 @@ function signalLabel(sig, conf) {
   return "🟡 HOLD";
 }
 
-function openTrade(symbol, direction, price) {
+// ✅ توا كيبعت للسيرفر (POST /api/trade/open) بدل التخزين المحلي
+async function openTrade(symbol, direction, price) {
   const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
-  const capital = s.capital || 1000;
-  const riskPct = (s.risk || 1) / 100;
   const slPct = (s.sl || 1.5) / 100;
   const tpPct = (s.tp || 3) / 100;
-
   const sl = direction === "buy" ? price * (1 - slPct) : price * (1 + slPct);
   const tp = direction === "buy" ? price * (1 + tpPct) : price * (1 - tpPct);
-  const potentialProfit = capital * riskPct * (tpPct / slPct);
   const sigInfo = latestSignals[symbol] || {};
   const reason = (sigInfo.reasons || []).join(" + ") || "-";
 
-  const trades = loadTrades();
-  trades.push({
-    id: Date.now(),
-    symbol, direction, entry: price,
-    sl: sl.toFixed(5), tp: tp.toFixed(5),
-    profit: potentialProfit.toFixed(2),
-    status: "open", result: null,
-    reason,
-    openedAt: Date.now(),
-    closedAt: null
+  const res = await fetch("/api/trade/open", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ symbol, direction, price, sl, tp, market: "forex", reason }),
   });
-  saveTrades(trades);
+  const data = await res.json();
+  if (data.error === "duplicate_position") {
+    alert("عندك ديجا صفقة مفتوحة لهاد الزوج");
+    return;
+  }
   renderTrades();
   renderStats();
 }
 
-function closeTrade(id, result) {
-  const trades = loadTrades();
-  const t = trades.find(t => t.id === id);
-  if (t) { t.status = "closed"; t.closedAt = Date.now(); if (result) t.result = result; }
-  saveTrades(trades);
+async function closeTrade(id) {
+  await fetch(`/api/trade/close/${id}`, { method: "POST" });
   renderTrades();
   renderStats();
 }
@@ -432,35 +422,18 @@ function formatDuration(ms) {
   return hrs + " س " + (mins % 60) + " د";
 }
 
-// يتحقق من الصفقات المفتوحة عند كل تحديث أسعار: TP/SL تحققو أوتوماتيك
-function checkOpenTrades() {
-  const trades = loadTrades();
-  let changed = false;
-  trades.forEach(t => {
-    if (t.status !== "open") return;
-    const cur = latestSignals[t.symbol];
-    if (!cur || !cur.price) return;
-    const price = cur.price;
-    if (t.direction === "buy") {
-      if (price >= parseFloat(t.tp)) { t.status = "closed"; t.result = "win"; t.closedAt = Date.now(); changed = true; }
-      else if (price <= parseFloat(t.sl)) { t.status = "closed"; t.result = "loss"; t.closedAt = Date.now(); changed = true; }
-    } else {
-      if (price <= parseFloat(t.tp)) { t.status = "closed"; t.result = "win"; t.closedAt = Date.now(); changed = true; }
-      else if (price >= parseFloat(t.sl)) { t.status = "closed"; t.result = "loss"; t.closedAt = Date.now(); changed = true; }
-    }
-  });
-  if (changed) saveTrades(trades);
-}
-
-function renderTrades() {
-  const trades = loadTrades().slice().reverse();
+async function renderTrades() {
+  const res = await fetch("/api/trades");
+  const trades = await res.json();
   const tbody = document.getElementById("trades");
   if (trades.length === 0) {
     tbody.innerHTML = '<tr><td colspan="9" style="color:#666;">لا توجد صفقات بعد</td></tr>';
     return;
   }
   tbody.innerHTML = trades.map(t => {
-    const dur = formatDuration((t.closedAt || Date.now()) - t.openedAt);
+    const openedMs = t.opened_at * 1000;
+    const closedMs = t.closed_at ? t.closed_at * 1000 : Date.now();
+    const dur = formatDuration(closedMs - openedMs);
     const statusTxt = t.status === "open" ? '<span class="badge-open">مفتوحة</span>' :
       (t.result === "win" ? '<span class="green">ربح ✅</span>' : t.result === "loss" ? '<span class="red">خسارة ❌</span>' : '<span class="badge-closed">مغلقة</span>');
     return `
@@ -470,7 +443,7 @@ function renderTrades() {
       <td>${t.entry}</td>
       <td>${t.sl}</td>
       <td>${t.tp}</td>
-      <td class="green">${t.profit}</td>
+      <td class="green">-</td>
       <td>${statusTxt}</td>
       <td>${dur}</td>
       <td>${t.status === "open" ? `<button class="btn-close" onclick="closeTrade(${t.id})">إغلاق</button>` : ""}</td>
@@ -478,25 +451,14 @@ function renderTrades() {
   `; }).join("");
 }
 
-function renderStats() {
-  const trades = loadTrades();
-  const closedToday = trades.filter(t => t.status === "closed" && t.closedAt && new Date(t.closedAt).toDateString() === new Date().toDateString());
-  const wins = closedToday.filter(t => t.result === "win");
-  const losses = closedToday.filter(t => t.result === "loss");
-  const winRate = closedToday.length ? ((wins.length / closedToday.length) * 100).toFixed(0) : "—";
-  const profitToday = wins.reduce((sum, t) => sum + parseFloat(t.profit), 0).toFixed(2);
-  const lossToday = losses.reduce((sum, t) => sum + parseFloat(t.profit), 0).toFixed(2);
-  const openCount = trades.filter(t => t.status === "open").length;
-  const bestPairMap = {};
-  wins.forEach(t => { bestPairMap[t.symbol] = (bestPairMap[t.symbol] || 0) + parseFloat(t.profit); });
-  const bestPair = Object.keys(bestPairMap).sort((a,b) => bestPairMap[b]-bestPairMap[a])[0] || "—";
-
+async function renderStats() {
+  const res = await fetch("/api/trade-stats");
+  const s = await res.json();
   document.getElementById("stats").innerHTML = `
-    <div class="stat-box"><div class="val">${winRate}%</div><div class="lbl">📈 نسبة النجاح</div></div>
-    <div class="stat-box"><div class="val green">$${profitToday}</div><div class="lbl">💰 ربح اليوم</div></div>
-    <div class="stat-box"><div class="val red">$${lossToday}</div><div class="lbl">📉 خسارة اليوم</div></div>
-    <div class="stat-box"><div class="val">${openCount}</div><div class="lbl">🔥 صفقات مفتوحة</div></div>
-    <div class="stat-box" style="grid-column:span 2;"><div class="val">${bestPair}</div><div class="lbl">🏆 أفضل زوج اليوم</div></div>
+    <div class="stat-box"><div class="val">${s.win_rate !== null ? s.win_rate + '%' : '—'}</div><div class="lbl">📈 نسبة النجاح</div></div>
+    <div class="stat-box"><div class="val">${s.wins_today}</div><div class="lbl">✅ صفقات رابحة اليوم</div></div>
+    <div class="stat-box"><div class="val">${s.losses_today}</div><div class="lbl">❌ صفقات خاسرة اليوم</div></div>
+    <div class="stat-box"><div class="val">${s.open_count}</div><div class="lbl">🔥 صفقات مفتوحة</div></div>
   `;
 }
 
@@ -507,132 +469,51 @@ async function loadSignals() {
     latestSignals = {};
     data.signals.forEach(s => latestSignals[s.symbol] = s);
 
-    checkOpenTrades();
-
     const div = document.getElementById("signals");
     div.innerHTML = data.signals.map(s => {
       const cls = signalClass(s.signal, s.confidence);
       const label = signalLabel(s.signal, s.confidence);
-      const reasonTxt = (s.reasons && s.reasons.length) ? s.reasons.join(" + ") : "لم تصل الثقة لعتبة الدخول (80%)";
+      const priceTxt = s.price !== null ? s.price : "—";
+      const reasonsTxt = (s.reasons || []).join(" + ") || "-";
+      const confPct = Math.round((s.confidence || 0) * 100);
       return `
-      <div class="sig-row">
-        <div class="sig-top">
-          <div><b>${s.symbol}</b> — ${s.price ?? "—"}</div>
-          <div class="${cls}">${label} (${(s.confidence*100).toFixed(0)}%)</div>
-          <div>
-            <button class="btn-buy" onclick="openTrade('${s.symbol}','buy',${s.price})" ${!s.price ? "disabled" : ""}>شراء</button>
-            <button class="btn-sell" onclick="openTrade('${s.symbol}','sell',${s.price})" ${!s.price ? "disabled" : ""}>بيع</button>
+        <div class="sig-row">
+          <div class="sig-top">
+            <div>
+              <button class="btn-buy" onclick="openTrade('${s.symbol}','buy',${s.price})" style="padding:4px 10px;font-size:11px;">شراء</button>
+              <button class="btn-sell" onclick="openTrade('${s.symbol}','sell',${s.price})" style="padding:4px 10px;font-size:11px;">بيع</button>
+            </div>
+            <div style="text-align:left;">
+              <span class="${cls}">${label} (${confPct}%)</span> — <b>${s.symbol}</b><br>
+              <span style="font-size:12px;color:#aaa;">${priceTxt}</span>
+            </div>
           </div>
+          <div class="sig-reason">${reasonsTxt}</div>
         </div>
-        <div class="sig-reason">${reasonTxt} = ${label} (${(s.confidence*100).toFixed(0)}%)</div>
-      </div>
-    `; }).join("");
+      `;
+    }).join("");
 
     renderTrades();
     renderStats();
   } catch (e) {
-    document.getElementById("signals").innerHTML = "❌ خطأ فـ جلب الإشارات";
+    document.getElementById("signals").innerHTML = "خطأ فتحميل الإشارات: " + e.message;
   }
 }
 
 loadSettings();
-renderTrades();
-renderStats();
 loadSignals();
-setInterval(loadSignals, 20000);
+setInterval(loadSignals, 15000);
 </script>
 </body>
-</html>
-"""
+</html>"""
 
 
-@app.route("/forex-dashboard", methods=["GET"])
+@app.route("/", methods=["GET"])
+@app.route("/dashboard", methods=["GET"])
 def forex_dashboard():
     return FOREX_DASHBOARD_HTML
 
 
-# ─────────────────────────────────────────────────────────
-# 🤖 Telegram Webhook — كيرد على الأوامر (/start, /status, /signals)
-# ─────────────────────────────────────────────────────────
-
-def _handle_telegram_command(text: str, chat_id):
-    cmd = text.strip().split()[0].lower() if text.strip() else ""
-
-    if cmd == "/start":
-        send_telegram_message(
-            chat_id,
-            "🤖 <b>PRO TRADING BOT</b> — مرحبا بيك!\n\n"
-            "هذا البوت كيبعت تنبيهات آلية بلا تدخلك (buy/sell) على العملات لي تحت المراقبة.\n\n"
-            "الأوامر المتاحة:\n"
-            "/status — حالة السيرفر\n"
-            "/signals — آخر إشارات كل العملات (كريبتو)\n"
-            "/forex — آخر إشارات الفوركس + ذهب/فضة",
-        )
-    elif cmd == "/status":
-        send_telegram_message(chat_id, f"✅ السيرفر شغال. حد الثقة الحالي: {CONFIDENCE_THRESHOLD*100:.0f}%")
-    elif cmd == "/signals":
-        results = [_get_cached_or_compute(s) for s in SUPPORTED_SYMBOLS]
-        lines = [f"{r['symbol']}: {r['signal']} ({r['confidence']*100:.0f}%)" for r in results]
-        send_telegram_message(chat_id, "📊 <b>آخر الإشارات</b>\n" + "\n".join(lines))
-    elif cmd == "/forex":
-        results = [_get_cached_or_compute(s, market="forex") for s in FOREX_SYMBOLS]
-        lines = [f"{r['symbol']}: {r['signal']} ({r['confidence']*100:.0f}%)" for r in results]
-        send_telegram_message(chat_id, "💱 <b>فوركس + ذهب/فضة</b>\n" + "\n".join(lines))
-    else:
-        send_telegram_message(chat_id, "❓ أمر غير معروف. جرب /start")
-
-
-@app.route("/telegram/webhook", methods=["POST"])
-def telegram_webhook():
-    # حماية بسيطة: Telegram كيبعت هاد الهيدر إيلا كنت غادي بـ secret_token فـ setWebhook
-    if TELEGRAM_WEBHOOK_SECRET:
-        header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-        if header_secret != TELEGRAM_WEBHOOK_SECRET:
-            return jsonify({"error": "unauthorized"}), 401
-
-    update = request.get_json(silent=True) or {}
-    message = update.get("message") or update.get("edited_message")
-    if message:
-        chat_id = message.get("chat", {}).get("id")
-        text = message.get("text", "")
-        if chat_id and text.startswith("/"):
-            try:
-                _handle_telegram_command(text, chat_id)
-            except Exception as e:
-                logger.error(f"❌ خطأ فـ معالجة أمر تيليجرام: {e}")
-
-    return jsonify({"ok": True})
-
-
-# ─────────────────────────────────────────────────────────
-# ⚡ فيتامين سي — Keep-Alive باش الـ free instance ما ينعسش
-# Render كيرقد السيرفر بعد ~15 دقيقة بلا طلبات خارجية.
-# هاد الـ thread كيضرب URL العمومي ديال السيرفر (ماشي localhost)
-# كل 10 دقايق باش يبقى live.
-# ─────────────────────────────────────────────────────────
-
-KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_INTERVAL_SECONDS", str(10 * 60)))
-# Render كيزيد هاد الـ env var أوتوماتيكيا (اسم السيرفيس + .onrender.com)
-SELF_URL = os.getenv("RENDER_EXTERNAL_URL", "")
-
-
-def _keep_alive_loop():
-    if not SELF_URL:
-        logger.warning("⚠️ RENDER_EXTERNAL_URL غير موجود — keep-alive معطل")
-        return
-    ping_url = f"{SELF_URL.rstrip('/')}/api/health"
-    while True:
-        time.sleep(KEEP_ALIVE_INTERVAL)
-        try:
-            requests.get(ping_url, timeout=10)
-            logger.info("💊 keep-alive ping ✅")
-        except Exception as e:
-            logger.warning(f"⚠️ keep-alive ping فشل: {e}")
-
-
-threading.Thread(target=_keep_alive_loop, daemon=True).start()
-
-
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
