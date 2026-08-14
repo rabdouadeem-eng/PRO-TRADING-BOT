@@ -20,7 +20,7 @@ from strategies.technical_indicators import TechnicalIndicators
 from strategies.bottom_top_detector import BottomTopDetector
 from ai_teacher.trading_mentor import TradingMentor
 from utils.logger import setup_logger
-from position_tracker import PositionTracker
+from api.position_tracker import PositionTracker
 
 logger = setup_logger("signal_server")
 
