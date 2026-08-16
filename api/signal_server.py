@@ -312,11 +312,8 @@ def get_forex_signal(symbol):
 
 @app.route("/api/forex-signals", methods=["GET"])
 def get_all_forex_signals():
-    results = []
-    for i, s in enumerate(FOREX_SYMBOLS):
-        results.append(_get_cached_or_compute(s, market="forex"))
-        if i < len(FOREX_SYMBOLS) - 1:
-            time.sleep(8)  # ✅ تباعد بين الطلبات لتفادي 429 (حد Twelve Data: 8/دقيقة)
+    # ✅ لا ننتظر (sleep) هنا — الطلب يرجع فوراً من الكاش المحدث من الحلقة الخلفية
+    results = [_get_cached_or_compute(s, market="forex") for s in FOREX_SYMBOLS]
     return jsonify({"threshold": CONFIDENCE_THRESHOLD, "signals": results, "ts": time.time()})
 
 
