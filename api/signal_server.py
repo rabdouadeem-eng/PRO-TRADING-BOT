@@ -111,7 +111,7 @@ SUPPORTED_SYMBOLS = [
 ]
 
 CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", "0.80"))
-CACHE_TTL_SECONDS = int(os.getenv("SIGNAL_CACHE_TTL", "20"))
+CACHE_TTL_SECONDS = int(os.getenv("SIGNAL_CACHE_TTL", "60"))
 
 # ✅ إعدادات التداول التلقائي (نفس الافتراضيات ديال لوحة التحكم: SL 1.5% / TP 3%)
 AUTO_TRADE_ENABLED = os.getenv("AUTO_TRADE_ENABLED", "true").lower() == "true"
@@ -246,6 +246,8 @@ def _auto_trade_loop():
             for symbol in AUTO_TRADE_SYMBOLS:
                 market = _market_for_symbol(symbol)
                 sig = _get_cached_or_compute(symbol, market=market)
+                if market == "forex":
+                    time.sleep(8)  # ✅ تباعد بين طلبات الفوركس لتفادي 429
 
                 if sig["signal"] not in ("buy", "sell"):
                     continue
@@ -310,7 +312,11 @@ def get_forex_signal(symbol):
 
 @app.route("/api/forex-signals", methods=["GET"])
 def get_all_forex_signals():
-    results = [_get_cached_or_compute(s, market="forex") for s in FOREX_SYMBOLS]
+    results = []
+    for i, s in enumerate(FOREX_SYMBOLS):
+        results.append(_get_cached_or_compute(s, market="forex"))
+        if i < len(FOREX_SYMBOLS) - 1:
+            time.sleep(8)  # ✅ تباعد بين الطلبات لتفادي 429 (حد Twelve Data: 8/دقيقة)
     return jsonify({"threshold": CONFIDENCE_THRESHOLD, "signals": results, "ts": time.time()})
 
 
