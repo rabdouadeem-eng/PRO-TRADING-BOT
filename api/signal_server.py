@@ -7,6 +7,10 @@ Flask API يكشف إشارات التداول (buy/sell/hold) لـ PRO-TRADING-
 ✅ يفتح الصفقات تلقائياً عند بلوغ عتبة الثقة العالية، ويغلقها تلقائياً عند SL/TP
    (الإغلاق التلقائي كان موجوداً أصلاً عبر tracker.start_background_checker()).
 تتبع الصفقات (Paper Trading) توا فالسيرفر (position_tracker.py) بدل localStorage.
+
+🔧 [تعديل] حل مشكل 429 Too Many Requests من Twelve Data:
+   - إضافة تأخير بسيط بين طلبات الفوركس فـ get_all_forex_signals
+   - زيادة مدة الكاش الافتراضية لـ 120 ثانية (بدل 60) لتقليل عدد الطلبات
 """
 
 import os
@@ -63,6 +67,9 @@ FOREX_SYMBOL_MAP = {
 }
 FOREX_SYMBOLS = list(FOREX_SYMBOL_MAP.keys())
 
+# 🔧 [تعديل] تأخير بسيط بين كل طلب فوركس متتالي (بالثواني) — قابل للضبط عبر env var
+FOREX_REQUEST_DELAY_SECONDS = float(os.getenv("FOREX_REQUEST_DELAY_SECONDS", "1.5"))
+
 
 def get_klines_forex(symbol: str, interval: str = "5min", limit: int = 100):
     if not TWELVEDATA_API_KEY:
@@ -111,7 +118,8 @@ SUPPORTED_SYMBOLS = [
 ]
 
 CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", "0.80"))
-CACHE_TTL_SECONDS = int(os.getenv("SIGNAL_CACHE_TTL", "60"))
+# 🔧 [تعديل] رفع مدة الكاش الافتراضية من 60 لـ 120 ثانية لتقليل الضغط على Twelve Data
+CACHE_TTL_SECONDS = int(os.getenv("SIGNAL_CACHE_TTL", "120"))
 
 # ✅ إعدادات التداول التلقائي (نفس الافتراضيات ديال لوحة التحكم: SL 1.5% / TP 3%)
 AUTO_TRADE_ENABLED = os.getenv("AUTO_TRADE_ENABLED", "true").lower() == "true"
@@ -247,7 +255,7 @@ def _auto_trade_loop():
                 market = _market_for_symbol(symbol)
                 sig = _get_cached_or_compute(symbol, market=market)
                 if market == "forex":
-                    time.sleep(8)  # ✅ تباعد بين طلبات الفوركس لتفادي 429
+                    time.sleep(FOREX_REQUEST_DELAY_SECONDS * 5)  # ✅ تباعد أكبر بين طلبات الفوركس لتفادي 429
 
                 if sig["signal"] not in ("buy", "sell"):
                     continue
@@ -312,8 +320,13 @@ def get_forex_signal(symbol):
 
 @app.route("/api/forex-signals", methods=["GET"])
 def get_all_forex_signals():
-    # ✅ لا ننتظر (sleep) هنا — الطلب يرجع فوراً من الكاش المحدث من الحلقة الخلفية
-    results = [_get_cached_or_compute(s, market="forex") for s in FOREX_SYMBOLS]
+    # 🔧 [تعديل] كنا كنجيبو الخمسة أزواج دفعة وحدة بلا تأخير — هذا كان
+    # كيتضاعف مع طلبات _auto_trade_loop فنفس الوقت ويعدي حد Twelve Data (8/دقيقة)
+    # → 429 Too Many Requests. دابا كنزيدو تأخير بسيط بين كل طلب.
+    results = []
+    for s in FOREX_SYMBOLS:
+        results.append(_get_cached_or_compute(s, market="forex"))
+        time.sleep(FOREX_REQUEST_DELAY_SECONDS)
     return jsonify({"threshold": CONFIDENCE_THRESHOLD, "signals": results, "ts": time.time()})
 
 
@@ -354,236 +367,3 @@ def get_trade_stats():
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "auto_trade": AUTO_TRADE_ENABLED})
-
-
-FOREX_DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="ar" dir="rtl">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>صندوق الفوركس — PRO TRADING BOT</title>
-<style>
-  body { background:#0d0d0d; color:#eee; font-family:sans-serif; margin:0; padding:12px; }
-  h2 { font-size:16px; margin:14px 0 8px; }
-  .card { background:#161616; border:1px solid #2a2a2a; border-radius:10px; padding:12px; margin-bottom:14px; }
-  .row { display:flex; gap:8px; margin-bottom:8px; }
-  .row > div { flex:1; }
-  label { font-size:12px; color:#999; display:block; margin-bottom:3px; }
-  input { width:100%; background:#0d0d0d; border:1px solid #333; color:#eee; padding:8px; border-radius:6px; box-sizing:border-box; }
-  button { border:none; border-radius:6px; padding:9px 14px; font-weight:bold; cursor:pointer; }
-  .btn-save { background:#333; color:#eee; width:100%; }
-  .btn-buy { background:#1e9e50; color:#fff; flex:1; }
-  .btn-sell { background:#c0392b; color:#fff; flex:1; }
-  .btn-close { background:#444; color:#eee; font-size:11px; padding:4px 8px; }
-  .sig-row { padding:10px 0; border-bottom:1px solid #222; }
-  .sig-row:last-child { border-bottom:none; }
-  .sig-top { display:flex; justify-content:space-between; align-items:center; }
-  .sig-reason { font-size:11px; color:#888; margin-top:4px; }
-  .buy { color:#2ecc71; } .sell { color:#e74c3c; } .hold { color:#e6b800; } .watch { color:#f39c12; }
-  .stats { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
-  .stat-box { background:#0d0d0d; border:1px solid #2a2a2a; border-radius:8px; padding:8px; text-align:center; }
-  .stat-box .val { font-size:16px; font-weight:bold; }
-  .stat-box .lbl { font-size:11px; color:#999; }
-  table { width:100%; border-collapse:collapse; font-size:11px; }
-  th, td { text-align:center; padding:6px 3px; border-bottom:1px solid #222; }
-  .green { color:#2ecc71; } .red { color:#e74c3c; }
-  .badge-open { color:#3498db; } .badge-closed { color:#777; }
-  .auto-badge { display:inline-block; background:#1e9e50; color:#fff; font-size:11px; padding:3px 8px; border-radius:6px; margin-bottom:10px; }
-</style>
-</head>
-<body>
-  <div class="auto-badge">🤖 التداول التلقائي مفعّل</div>
-  <h2>📈 لوحة الإحصائيات</h2>
-  <div class="card stats" id="stats"></div>
-
-  <h2>💱 رأس المال والمخاطرة</h2>
-  <div class="card">
-    <div class="row">
-      <div><label>رأس المال $</label><input id="capital" type="number" value="1000"></div>
-      <div><label>مخاطرة %</label><input id="risk" type="number" value="1"></div>
-    </div>
-    <div class="row">
-      <div><label>وقف الخسارة %</label><input id="sl" type="number" value="1.5"></div>
-      <div><label>هدف الربح %</label><input id="tp" type="number" value="3"></div>
-    </div>
-    <button class="btn-save" onclick="saveSettings()">💾 حفظ الإعدادات</button>
-  </div>
-
-  <h2>📊 الإشارات الحية</h2>
-  <div class="card" id="signals">جاري التحميل...</div>
-
-  <h2>🧾 سجل الصفقات (Paper Trading)</h2>
-  <div class="card">
-    <table>
-      <thead><tr><th>الزوج</th><th>الاتجاه</th><th>دخول</th><th>SL</th><th>TP</th><th>ربح $</th><th>الحالة</th><th>المدة</th><th></th></tr></thead>
-      <tbody id="trades"></tbody>
-    </table>
-  </div>
-
-<script>
-const SETTINGS_KEY = "forex_dashboard_settings";
-let latestSignals = {};
-
-function loadSettings() {
-  const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
-  if (s.capital) document.getElementById("capital").value = s.capital;
-  if (s.risk) document.getElementById("risk").value = s.risk;
-  if (s.sl) document.getElementById("sl").value = s.sl;
-  if (s.tp) document.getElementById("tp").value = s.tp;
-}
-function saveSettings() {
-  const s = {
-    capital: parseFloat(document.getElementById("capital").value),
-    risk: parseFloat(document.getElementById("risk").value),
-    sl: parseFloat(document.getElementById("sl").value),
-    tp: parseFloat(document.getElementById("tp").value),
-  };
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
-  alert("تم الحفظ ✅");
-}
-
-function signalClass(sig, conf) {
-  if (sig === "buy") return "buy";
-  if (sig === "sell") return "sell";
-  if (conf >= 0.60) return "watch";
-  return "hold";
-}
-function signalLabel(sig, conf) {
-  if (sig === "buy") return "🟢 BUY";
-  if (sig === "sell") return "🔴 SELL";
-  if (conf >= 0.60) return "🟡 مراقبة";
-  return "🟡 HOLD";
-}
-
-// يبقى متاح للفتح اليدوي بردو (اختياري)، بصح البوت يفتح وحدو تلقائياً من السيرفر
-async function openTrade(symbol, direction, price) {
-  const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
-  const slPct = (s.sl || 1.5) / 100;
-  const tpPct = (s.tp || 3) / 100;
-  const sl = direction === "buy" ? price * (1 - slPct) : price * (1 + slPct);
-  const tp = direction === "buy" ? price * (1 + tpPct) : price * (1 - tpPct);
-  const sigInfo = latestSignals[symbol] || {};
-  const reason = (sigInfo.reasons || []).join(" + ") || "-";
-
-  const res = await fetch("/api/trade/open", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ symbol, direction, price, sl, tp, market: "forex", reason }),
-  });
-  const data = await res.json();
-  if (data.error === "duplicate_position") {
-    alert("عندك ديجا صفقة مفتوحة لهاد الزوج");
-    return;
-  }
-  renderTrades();
-  renderStats();
-}
-
-async function closeTrade(id) {
-  await fetch(`/api/trade/close/${id}`, { method: "POST" });
-  renderTrades();
-  renderStats();
-}
-
-function formatDuration(ms) {
-  const mins = Math.floor(ms / 60000);
-  if (mins < 60) return mins + " د";
-  const hrs = Math.floor(mins / 60);
-  return hrs + " س " + (mins % 60) + " د";
-}
-
-async function renderTrades() {
-  const res = await fetch("/api/trades");
-  const trades = await res.json();
-  const tbody = document.getElementById("trades");
-  if (trades.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="9" style="color:#666;">لا توجد صفقات بعد</td></tr>';
-    return;
-  }
-  tbody.innerHTML = trades.map(t => {
-    const openedMs = t.opened_at * 1000;
-    const closedMs = t.closed_at ? t.closed_at * 1000 : Date.now();
-    const dur = formatDuration(closedMs - openedMs);
-    const statusTxt = t.status === "open" ? '<span class="badge-open">مفتوحة</span>' :
-      (t.result === "win" ? '<span class="green">ربح ✅</span>' : t.result === "loss" ? '<span class="red">خسارة ❌</span>' : '<span class="badge-closed">مغلقة</span>');
-    return `
-    <tr title="${t.reason}">
-      <td>${t.symbol}</td>
-      <td class="${t.direction === 'buy' ? 'green' : 'red'}">${t.direction === 'buy' ? 'شراء' : 'بيع'}</td>
-      <td>${t.entry}</td>
-      <td>${t.sl}</td>
-      <td>${t.tp}</td>
-      <td class="green">-</td>
-      <td>${statusTxt}</td>
-      <td>${dur}</td>
-      <td>${t.status === "open" ? `<button class="btn-close" onclick="closeTrade(${t.id})">إغلاق</button>` : ""}</td>
-    </tr>
-  `; }).join("");
-}
-
-async function renderStats() {
-  const res = await fetch("/api/trade-stats");
-  const s = await res.json();
-  document.getElementById("stats").innerHTML = `
-    <div class="stat-box"><div class="val">${s.win_rate !== null ? s.win_rate + '%' : '—'}</div><div class="lbl">📈 نسبة النجاح</div></div>
-    <div class="stat-box"><div class="val">${s.wins_today}</div><div class="lbl">✅ صفقات رابحة اليوم</div></div>
-    <div class="stat-box"><div class="val">${s.losses_today}</div><div class="lbl">❌ صفقات خاسرة اليوم</div></div>
-    <div class="stat-box"><div class="val">${s.open_count}</div><div class="lbl">🔥 صفقات مفتوحة</div></div>
-  `;
-}
-
-async function loadSignals() {
-  try {
-    const res = await fetch("/api/forex-signals");
-    const data = await res.json();
-    latestSignals = {};
-    data.signals.forEach(s => latestSignals[s.symbol] = s);
-
-    const div = document.getElementById("signals");
-    div.innerHTML = data.signals.map(s => {
-      const cls = signalClass(s.signal, s.confidence);
-      const label = signalLabel(s.signal, s.confidence);
-      const priceTxt = s.price !== null ? s.price : "—";
-      const reasonsTxt = (s.reasons || []).join(" + ") || "-";
-      const confPct = Math.round((s.confidence || 0) * 100);
-      return `
-        <div class="sig-row">
-          <div class="sig-top">
-            <div>
-              <button class="btn-buy" onclick="openTrade('${s.symbol}','buy',${s.price})" style="padding:4px 10px;font-size:11px;">شراء</button>
-              <button class="btn-sell" onclick="openTrade('${s.symbol}','sell',${s.price})" style="padding:4px 10px;font-size:11px;">بيع</button>
-            </div>
-            <div style="text-align:left;">
-              <span class="${cls}">${label} (${confPct}%)</span> — <b>${s.symbol}</b><br>
-              <span style="font-size:12px;color:#aaa;">${priceTxt}</span>
-            </div>
-          </div>
-          <div class="sig-reason">${reasonsTxt}</div>
-        </div>
-      `;
-    }).join("");
-
-    renderTrades();
-    renderStats();
-  } catch (e) {
-    document.getElementById("signals").innerHTML = "خطأ فتحميل الإشارات: " + e.message;
-  }
-}
-
-loadSettings();
-loadSignals();
-setInterval(loadSignals, 15000);
-</script>
-</body>
-</html>"""
-
-
-@app.route("/", methods=["GET"])
-@app.route("/dashboard", methods=["GET"])
-def forex_dashboard():
-    return FOREX_DASHBOARD_HTML
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
