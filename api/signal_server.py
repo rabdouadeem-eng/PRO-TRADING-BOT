@@ -107,6 +107,64 @@ def get_klines_forex(symbol: str, interval: str = "5min", limit: int = 100):
         return None
 
 
+# 🔧 [تعديل جديد] جلب كل أزواج الفوركس بطلب HTTP واحد فقط بدل 5 طلبات منفصلة.
+# Twelve Data كيدعم عدة symbols مفصولين بفاصلة فنفس endpoint (/time_series?symbol=EUR/USD,GBP/USD,...)
+# ورد الـAPI كيرجع dict مفتاحو الرمز (مثال: {"EUR/USD": {...}, "GBP/USD": {...}})
+def get_all_forex_klines_batch(interval: str = "5min", limit: int = 100) -> dict:
+    """يرجع dict: {symbol_internal: DataFrame} لكل أزواج الفوركس، بطلب واحد فقط."""
+    result = {}
+    if not TWELVEDATA_API_KEY:
+        logger.warning("⚠️ TWELVEDATA_API_KEY غير موجود — الفوركس معطل")
+        return result
+
+    td_symbols_str = ",".join(FOREX_SYMBOL_MAP.values())  # "EUR/USD,GBP/USD,USD/JPY,XAU/USD,XAG/USD"
+    reverse_map = {v: k for k, v in FOREX_SYMBOL_MAP.items()}  # "EUR/USD" -> "EURUSD"
+
+    try:
+        resp = requests.get(
+            TWELVEDATA_URL,
+            params={
+                "symbol": td_symbols_str,
+                "interval": interval,
+                "outputsize": limit,
+                "apikey": TWELVEDATA_API_KEY,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+
+        # لما تكون رمز واحد فقط، الرد كيكون flat (فيه "values" مباشرة)
+        # لما تكون عدة رموز، الرد كيكون dict مفتاحو كل رمز
+        if "values" in raw:
+            # حالة نادرة: رمز واحد غير
+            only_symbol = list(FOREX_SYMBOL_MAP.values())[0]
+            items = {only_symbol: raw}
+        else:
+            items = raw
+
+        for td_symbol, payload in items.items():
+            internal_symbol = reverse_map.get(td_symbol)
+            if not internal_symbol:
+                continue
+            values = payload.get("values") if isinstance(payload, dict) else None
+            if not values:
+                logger.error(f"❌ رد Twelve Data (batch) بلا بيانات لـ {td_symbol}: {payload}")
+                continue
+            df = pd.DataFrame(values)
+            df = df.rename(columns={"datetime": "timestamp"})
+            for col in ["open", "high", "low", "close"]:
+                df[col] = df[col].astype(float)
+            df["volume"] = df.get("volume", 0)
+            df = df.iloc[::-1].reset_index(drop=True)
+            result[internal_symbol] = df
+
+    except Exception as e:
+        logger.error(f"❌ خطأ فـ جلب بيانات Twelve Data (batch): {e}")
+
+    return result
+
+
 app = Flask(__name__)
 
 ALLOWED_ORIGIN = os.getenv("SANDOQ_ORIGIN", "*")
@@ -174,12 +232,13 @@ def _market_for_symbol(symbol: str) -> str:
     return "forex" if symbol in FOREX_SYMBOLS else "crypto"
 
 
-def _compute_signal(symbol: str, market: str = "crypto") -> dict:
+def _compute_signal(symbol: str, market: str = "crypto", df=None) -> dict:
     try:
-        if market == "forex":
-            df = get_klines_forex(symbol, interval="5min", limit=100)
-        else:
-            df = get_klines_mexc(symbol, interval="5m", limit=100)
+        if df is None:
+            if market == "forex":
+                df = get_klines_forex(symbol, interval="5min", limit=100)
+            else:
+                df = get_klines_mexc(symbol, interval="5m", limit=100)
 
         if df is None or len(df) < 30:
             return {
@@ -251,11 +310,17 @@ def _auto_trade_loop():
     )
     while True:
         try:
+            # 🔧 [تعديل] نجيبو كل إشارات الفوركس بطلب batch واحد أولا (يستعمل الكاش إلا كان صالح)
+            forex_signals = {s["symbol"]: s for s in _get_or_compute_all_forex_batch()}
+
             for symbol in AUTO_TRADE_SYMBOLS:
                 market = _market_for_symbol(symbol)
-                sig = _get_cached_or_compute(symbol, market=market)
                 if market == "forex":
-                    time.sleep(FOREX_REQUEST_DELAY_SECONDS * 5)  # ✅ تباعد أكبر بين طلبات الفوركس لتفادي 429
+                    sig = forex_signals.get(symbol)
+                    if sig is None:
+                        continue
+                else:
+                    sig = _get_cached_or_compute(symbol, market=market)
 
                 if sig["signal"] not in ("buy", "sell"):
                     continue
@@ -318,15 +383,39 @@ def get_forex_signal(symbol):
     return jsonify(_get_cached_or_compute(symbol, market="forex"))
 
 
+def _get_or_compute_all_forex_batch() -> list:
+    """يجيب كل أزواج الفوركس بطلب HTTP واحد فقط (batch)، ثم يحسب الإشارة لكل واحد.
+    إلا كان الكاش صالح لكل الأزواج، يرجع من الكاش بلا أي طلب جديد."""
+    now = time.time()
+    cached_results = {}
+    missing = []
+
+    with _cache_lock:
+        for s in FOREX_SYMBOLS:
+            cache_key = f"forex:{s}"
+            cached = _signal_cache.get(cache_key)
+            if cached and (now - cached["ts"]) < CACHE_TTL_SECONDS:
+                cached_results[s] = cached["data"]
+            else:
+                missing.append(s)
+
+    if missing:
+        # 🔧 [تعديل] طلب واحد فقط لكل الأزواج الناقصة بدل طلب لكل واحد
+        batch_data = get_all_forex_klines_batch(interval="5min", limit=100)
+        for s in missing:
+            df = batch_data.get(s)
+            data = _compute_signal(s, market="forex", df=df)
+            with _cache_lock:
+                _signal_cache[f"forex:{s}"] = {"data": data, "ts": time.time()}
+            cached_results[s] = data
+
+    return [cached_results[s] for s in FOREX_SYMBOLS]
+
+
 @app.route("/api/forex-signals", methods=["GET"])
 def get_all_forex_signals():
-    # 🔧 [تعديل] كنا كنجيبو الخمسة أزواج دفعة وحدة بلا تأخير — هذا كان
-    # كيتضاعف مع طلبات _auto_trade_loop فنفس الوقت ويعدي حد Twelve Data (8/دقيقة)
-    # → 429 Too Many Requests. دابا كنزيدو تأخير بسيط بين كل طلب.
-    results = []
-    for s in FOREX_SYMBOLS:
-        results.append(_get_cached_or_compute(s, market="forex"))
-        time.sleep(FOREX_REQUEST_DELAY_SECONDS)
+    # 🔧 [تعديل] طلب batch واحد فقط لكل الأزواج بدل 5 طلبات منفصلة — يحل مشكل 429
+    results = _get_or_compute_all_forex_batch()
     return jsonify({"threshold": CONFIDENCE_THRESHOLD, "signals": results, "ts": time.time()})
 
 
