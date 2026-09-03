@@ -1,4 +1,4 @@
-"""
+ص"""
 signal_server.py
 =================
 Flask API يكشف إشارات التداول (buy/sell/hold) لـ PRO-TRADING-BOT.
@@ -539,3 +539,45 @@ async function loadStats() {
     const res = await fetch("/api/trade-stats");
     const s = await res.json();
     document.getElementById("stats").i
+<div class="stat-box"><div class="val">${s.win_rate !== null ? s.win_rate + '%' : '—'}</div><div class="lbl">📈 نسبة النجاح</div></div>
+      <div class="stat-box"><div class="val">${s.open_count ?? '-'}</div><div class="lbl">صفقات مفتوحة</div></div>
+      <div class="stat-box"><div class="val">${s.wins_today ?? '-'}</div><div class="lbl">✅ رابحة اليوم</div></div>
+      <div class="stat-box"><div class="val">${s.losses_today ?? '-'}</div><div class="lbl">❌ خاسرة اليوم</div></div>
+    `;
+  } catch (e) {}
+}
+
+async function loadTrades() {
+  try {
+    const res = await fetch("/api/trades");
+    const trades = await res.json();
+    const tbody = document.getElementById("trades");
+    if (!trades.length) {
+      tbody.innerHTML = '<tr><td colspan="6" style="color:#666;">لا توجد صفقات بعد</td></tr>';
+      return;
+    }
+    tbody.innerHTML = trades.map(t => `
+      <tr>
+        <td>${t.symbol}</td>
+        <td class="${t.direction === 'buy' ? 'green' : 'red'}">${t.direction === 'buy' ? 'شراء' : 'بيع'}</td>
+        <td>${t.entry}</td>
+        <td>${t.sl}</td>
+        <td>${t.tp}</td>
+        <td>${t.status === 'open' ? '<span class="badge-open">مفتوحة</span>' : '<span class="badge-closed">مغلقة</span>'}</td>
+      </tr>
+    `).join("");
+  } catch (e) {}
+}
+
+function loadAll() { loadSignals(); loadStats(); loadTrades(); }
+loadAll();
+setInterval(loadAll, 300000);
+</script>
+</body>
+</html>"""
+
+
+@app.route("/", methods=["GET"])
+@app.route("/dashboard", methods=["GET"])
+def dashboard():
+    return FOREX_DASHBOARD_HTML
