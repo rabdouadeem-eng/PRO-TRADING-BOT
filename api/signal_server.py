@@ -177,7 +177,7 @@ SUPPORTED_SYMBOLS = [
 
 CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", "0.80"))
 # 🔧 [تعديل] رفع مدة الكاش الافتراضية من 60 لـ 120 ثانية لتقليل الضغط على Twelve Data
-CACHE_TTL_SECONDS = int(os.getenv("SIGNAL_CACHE_TTL", "120"))
+CACHE_TTL_SECONDS = int(os.getenv("SIGNAL_CACHE_TTL", "300"))
 
 # ✅ إعدادات التداول التلقائي (نفس الافتراضيات ديال لوحة التحكم: SL 1.5% / TP 3%)
 AUTO_TRADE_ENABLED = os.getenv("AUTO_TRADE_ENABLED", "true").lower() == "true"
@@ -538,46 +538,4 @@ async function loadStats() {
   try {
     const res = await fetch("/api/trade-stats");
     const s = await res.json();
-    document.getElementById("stats").innerHTML = `
-      <div class="stat-box"><div class="val">${s.win_rate !== null ? s.win_rate + '%' : '—'}</div><div class="lbl">📈 نسبة النجاح</div></div>
-      <div class="stat-box"><div class="val">${s.open_count ?? '-'}</div><div class="lbl">صفقات مفتوحة</div></div>
-      <div class="stat-box"><div class="val">${s.wins_today ?? '-'}</div><div class="lbl">✅ رابحة اليوم</div></div>
-      <div class="stat-box"><div class="val">${s.losses_today ?? '-'}</div><div class="lbl">❌ خاسرة اليوم</div></div>
-    `;
-  } catch (e) {}
-}
-
-async function loadTrades() {
-  try {
-    const res = await fetch("/api/trades");
-    const trades = await res.json();
-    const tbody = document.getElementById("trades");
-    if (!trades.length) {
-      tbody.innerHTML = '<tr><td colspan="6" style="color:#666;">لا توجد صفقات بعد</td></tr>';
-      return;
-    }
-    tbody.innerHTML = trades.map(t => `
-      <tr>
-        <td>${t.symbol}</td>
-        <td class="${t.direction === 'buy' ? 'green' : 'red'}">${t.direction === 'buy' ? 'شراء' : 'بيع'}</td>
-        <td>${t.entry}</td>
-        <td>${t.sl}</td>
-        <td>${t.tp}</td>
-        <td>${t.status === 'open' ? '<span class="badge-open">مفتوحة</span>' : '<span class="badge-closed">مغلقة</span>'}</td>
-      </tr>
-    `).join("");
-  } catch (e) {}
-}
-
-function loadAll() { loadSignals(); loadStats(); loadTrades(); }
-loadAll();
-setInterval(loadAll, 30000);
-</script>
-</body>
-</html>"""
-
-
-@app.route("/", methods=["GET"])
-@app.route("/dashboard", methods=["GET"])
-def dashboard():
-    return FOREX_DASHBOARD_HTML
+    document.getElementById("stats").i
