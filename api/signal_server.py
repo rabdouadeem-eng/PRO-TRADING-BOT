@@ -187,6 +187,10 @@ AUTO_TRADE_TP_PCT = float(os.getenv("AUTO_TRADE_TP_PCT", "3.0")) / 100
 AUTO_TRADE_INTERVAL_SECONDS = int(os.getenv("AUTO_TRADE_INTERVAL_SECONDS", "60"))
 AUTO_TRADE_SYMBOLS = SUPPORTED_SYMBOLS + FOREX_SYMBOLS
 
+# 🔧 [إضافة جديدة] رأس المال الافتراضي ونسبة المخاطرة لكل صفقة (للعرض فقط فالداشبورد حالياً)
+INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "1000"))
+RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1"))
+
 indicators = TechnicalIndicators()
 detector = BottomTopDetector()
 mentor = TradingMentor()
@@ -459,6 +463,17 @@ def health():
     return jsonify({"status": "ok", "auto_trade": AUTO_TRADE_ENABLED})
 
 
+@app.route("/api/settings", methods=["GET"])
+def get_settings():
+    return jsonify({
+        "capital": INITIAL_CAPITAL,
+        "risk_pct": RISK_PER_TRADE_PCT,
+        "sl_pct": round(AUTO_TRADE_SL_PCT * 100, 2),
+        "tp_pct": round(AUTO_TRADE_TP_PCT * 100, 2),
+        "confidence_threshold": CONFIDENCE_THRESHOLD,
+    })
+
+
 # 🔧 [إضافة جديدة] لوحة تحكم بصرية للفوركس — كانت مفقودة (404 على "/")
 FOREX_DASHBOARD_HTML = """<!DOCTYPE html>
 <html dir="rtl" lang="ar">
@@ -489,6 +504,10 @@ FOREX_DASHBOARD_HTML = """<!DOCTYPE html>
 </head>
 <body>
   <div class="auto-badge">🤖 التداول التلقائي مفعّل</div>
+
+  <h2>💱 رأس المال والمخاطرة</h2>
+  <div class="card stats" id="settings"></div>
+
   <h2>📊 الإشارات الحية — الفوركس</h2>
   <div class="card" id="signals">جاري التحميل...</div>
 
@@ -570,7 +589,20 @@ async function loadTrades() {
   } catch (e) {}
 }
 
-function loadAll() { loadSignals(); loadStats(); loadTrades(); }
+async function loadSettings() {
+  try {
+    const res = await fetch("/api/settings");
+    const s = await res.json();
+    document.getElementById("settings").innerHTML = `
+      <div class="stat-box"><div class="val">$${s.capital}</div><div class="lbl">رأس المال</div></div>
+      <div class="stat-box"><div class="val">${s.risk_pct}%</div><div class="lbl">مخاطرة/صفقة</div></div>
+      <div class="stat-box"><div class="val">${s.sl_pct}%</div><div class="lbl">وقف الخسارة</div></div>
+      <div class="stat-box"><div class="val">${s.tp_pct}%</div><div class="lbl">جني الأرباح</div></div>
+    `;
+  } catch (e) {}
+}
+
+function loadAll() { loadSettings(); loadSignals(); loadStats(); loadTrades(); }
 loadAll();
 setInterval(loadAll, 300000);
 </script>
