@@ -63,7 +63,8 @@ FOREX_SYMBOL_MAP = {
     "GBPUSD": "GBP/USD",
     "USDJPY": "USD/JPY",
     "XAUUSD": "XAU/USD",
-    "XAGUSD": "XAG/USD",
+    # 🔧 [تعديل] XAGUSD (الفضة) محذوف مؤقتاً — الخطة المجانية لـ Twelve Data لا تدعمه
+    # (كان يرجع 403 "not available with your plan" ويفشل الـbatch كاملاً بسببه)
 }
 FOREX_SYMBOLS = list(FOREX_SYMBOL_MAP.keys())
 
